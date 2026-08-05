@@ -1,0 +1,27 @@
+[MAIN]
+# PyQt6 ships compiled C-extension modules that static analysis cannot
+# introspect, producing bogus "No name 'X' in module" errors. Tell pylint to
+# load and trust them.
+extension-pkg-allow-list = PyQt6,PyQt6.QtCore,PyQt6.QtGui,PyQt6.QtWidgets,PyQt6.QtWebEngineCore,PyQt6.QtWebEngineWidgets
+
+[FORMAT]
+max-line-length = 100
+
+[MESSAGES CONTROL]
+disable =
+    missing-module-docstring,
+    missing-class-docstring,
+    missing-function-docstring,
+    broad-exception-caught,
+    too-many-instance-attributes,
+    too-few-public-methods,
+    too-many-lines,
+    too-many-statements,
+    too-many-return-statements,
+    too-many-branches,
+    subprocess-run-check,
+    unnecessary-lambda
+
+[TYPECHECK]
+# Silences false positives on dynamically-provided Qt members.
+generated-members = PyQt6.*

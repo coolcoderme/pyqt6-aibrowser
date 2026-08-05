@@ -1,0 +1,9 @@
+[flake8]
+max-line-length = 100
+# E203: whitespace before ':' conflicts with Black's slice formatting.
+# W503: line break before binary operator (also Black-compatible).
+extend-ignore = E203, W503
+exclude =
+    .git,
+    __pycache__,
+    browser_data
