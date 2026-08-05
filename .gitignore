@@ -1,0 +1,9 @@
+# Browser profile, cookies, cache, bookmarks, history, and API key
+browser_data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
