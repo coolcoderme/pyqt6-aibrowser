@@ -1,0 +1,11 @@
+# Runtime dependencies for browserdemo.py (PyQt6 desktop browser + LLM agent)
+PyQt6
+PyQt6-WebEngine
+
+# Lint tooling (configured by .flake8 and .pylintrc)
+flake8
+pylint
+
+# Optional: enables the in-app "Cursor SDK" agent provider.
+# Uncomment to install. The app runs fully without it.
+# cursor-sdk
