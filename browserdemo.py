@@ -1,8 +1,9 @@
 """A tabbed web browser built with PyQt6 and QtWebEngine.
 
-Features: tabs, navigation, smart address bar, persistent cookies,
-bookmarks, browsing history, a page-load progress bar, a library sidebar,
-download handling, and an LLM-powered browsing agent.
+Features: tabs, automatic tab groups by site type (shopping, travel, …),
+navigation, smart address bar, persistent cookies, bookmarks, browsing
+history, a page-load progress bar, a library sidebar, download handling,
+and an LLM-powered browsing agent.
 """
 
 import json
@@ -15,7 +16,7 @@ import urllib.request
 from datetime import datetime
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtGui import QAction, QColor, QKeySequence, QPainter
 from PyQt6.QtWebEngineCore import (
     QWebEngineDownloadRequest,
     QWebEnginePage,
@@ -39,6 +40,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QTabBar,
     QTabWidget,
     QTextEdit,
     QToolBar,
@@ -606,6 +608,367 @@ def _save_json(path, data):
         pass
 
 
+# ---------------------------------------------------------- tab site groups
+# Open tabs are classified by hostname (and a few Google paths) into a small
+# set of website types. Matching prefers exact domain suffixes, then a brand
+# label in the host, then conservative keywords.
+
+TAB_CATEGORY_INFO = {
+    "search": ("Search", "#27AE60"),
+    "shopping": ("Shopping", "#E67E22"),
+    "travel": ("Travel", "#1ABC9C"),
+    "food": ("Food", "#F39C12"),
+    "video": ("Video", "#C0392B"),
+    "social": ("Social", "#8E44AD"),
+    "news": ("News", "#2980B9"),
+    "sports": ("Sports", "#2ECC71"),
+    "finance": ("Finance", "#16A085"),
+    "email": ("Email", "#D35400"),
+    "work": ("Work", "#34495E"),
+    "tech": ("Tech", "#3498DB"),
+    "other": ("Other", "#7F8C8D"),
+}
+TAB_CATEGORY_ORDER = [
+    "search",
+    "shopping",
+    "travel",
+    "food",
+    "video",
+    "social",
+    "news",
+    "sports",
+    "finance",
+    "email",
+    "work",
+    "tech",
+    "other",
+]
+
+# Distinctive second-level names. "amazon.co.uk" matches the "amazon" label.
+_BRAND_BLOBS = {
+    "search": "google bing duckduckgo yahoo baidu yandex ecosia startpage kagi",
+    "shopping": (
+        "amazon ebay etsy walmart target aliexpress alibaba shein temu "
+        "bestbuy newegg ikea costco wayfair overstock kohls macys nordstrom "
+        "sephora ulta rakuten mercari poshmark depop stockx chewy petco "
+        "homedepot lowes zara nike adidas shopify wish qvc zappos "
+        "bloomingdales saksfifthavenue barneys"
+    ),
+    "travel": (
+        "booking expedia airbnb kayak tripadvisor hotels marriott hilton "
+        "hyatt delta united southwest jetblue ryanair easyjet airfrance "
+        "lufthansa emirates vrbo agoda hotwire priceline skyscanner hopper "
+        "orbitz travelocity uber lyft britishairways spirit"
+    ),
+    "food": (
+        "doordash ubereats grubhub postmates seamless opentable instacart "
+        "deliveroo justeat swiggy zomato resy allrecipes epicurious "
+        "foodnetwork yelp"
+    ),
+    "video": (
+        "youtube netflix hulu disneyplus twitch vimeo dailymotion "
+        "crunchyroll peacock tubi rumble primevideo hbomax paramountplus "
+        "pluto"
+    ),
+    "social": (
+        "facebook instagram twitter reddit linkedin tiktok pinterest "
+        "snapchat discord whatsapp telegram threads tumblr nextdoor quora "
+        "mastodon messenger"
+    ),
+    "news": (
+        "cnn bbc nytimes washingtonpost reuters npr foxnews nbcnews "
+        "cbsnews abcnews bloomberg politico huffpost thehill latimes "
+        "usatoday forbes axios vice vox aljazeera economist newsweek "
+        "theguardian wsj time"
+    ),
+    "sports": (
+        "espn nfl nba mlb nhl fifa uefa bleacherreport theathletic "
+        "cbssports foxsports skysports olympics pga atptour ufc wwe"
+    ),
+    "finance": (
+        "paypal chase bankofamerica wellsfargo capitalone americanexpress "
+        "fidelity schwab vanguard coinbase binance kraken robinhood etrade "
+        "sofi venmo cashapp revolut stripe chime ally discover wise"
+    ),
+    "email": "gmail protonmail proton fastmail zoho aol hotmail outlook",
+    "work": (
+        "github gitlab bitbucket atlassian asana trello notion slack zoom "
+        "dropbox evernote clickup figma miro canva sharepoint office365 "
+        "monday linear confluence jira"
+    ),
+    "tech": (
+        "stackoverflow stackexchange arxiv wikipedia producthunt wired "
+        "techcrunch theverge arstechnica engadget zdnet xda mdn "
+        "hackernews"
+    ),
+}
+
+SITE_BRANDS = {}
+for _cat, _blob in _BRAND_BLOBS.items():
+    for _brand in _blob.split():
+        SITE_BRANDS[_brand] = _cat
+
+# Multi-part hosts and short domains that brand-label matching would miss.
+SITE_DOMAINS = {
+    "youtu.be": "video",
+    "youtube.com": "video",
+    "music.youtube.com": "video",
+    "primevideo.com": "video",
+    "max.com": "video",
+    "hbomax.com": "video",
+    "disneyplus.com": "video",
+    "plus.disney.com": "video",
+    "twitch.tv": "video",
+    "x.com": "social",
+    "twitter.com": "social",
+    "fb.com": "social",
+    "t.me": "social",
+    "wa.me": "social",
+    "news.ycombinator.com": "tech",
+    "ycombinator.com": "tech",
+    "stackoverflow.com": "tech",
+    "stackexchange.com": "tech",
+    "wikipedia.org": "tech",
+    "developer.mozilla.org": "tech",
+    "github.com": "work",
+    "gitlab.com": "work",
+    "office.com": "work",
+    "office365.com": "work",
+    "live.com": "email",
+    "outlook.com": "email",
+    "outlook.live.com": "email",
+    "outlook.office.com": "work",
+    "gmail.com": "email",
+    "mail.google.com": "email",
+    "docs.google.com": "work",
+    "sheets.google.com": "work",
+    "slides.google.com": "work",
+    "drive.google.com": "work",
+    "calendar.google.com": "work",
+    "meet.google.com": "work",
+    "chat.google.com": "work",
+    "classroom.google.com": "work",
+    "maps.google.com": "travel",
+    "flights.google.com": "travel",
+    "travel.google.com": "travel",
+    "news.google.com": "news",
+    "shopping.google.com": "shopping",
+    "finance.google.com": "finance",
+    "google.com": "search",
+    "bbc.co.uk": "news",
+    "bbc.com": "news",
+    "theguardian.com": "news",
+    "nytimes.com": "news",
+    "wsj.com": "news",
+    "si.com": "sports",
+    "apple.com": "tech",
+    "icloud.com": "email",
+    "amazon.com": "shopping",
+    "amazon.co.uk": "shopping",
+    "amazon.de": "shopping",
+    "amazon.co.jp": "shopping",
+}
+
+_HOST_KEYWORDS = (
+    ("shopping", ("shop", "store", "boutique", "outlet", "marketplace")),
+    ("travel", ("hotel", "flight", "airline", "airport", "vacation",
+                "booking", "travel", "hostel", "cruise")),
+    ("food", ("recipe", "restaurant", "grocery", "pizza")),
+    ("video", ("video", "stream", "movie")),
+    ("news", ("news", "gazette", "herald", "tribune")),
+    ("sports", ("sport", "football", "soccer")),
+    ("finance", ("bank", "creditunion", "invest", "trading", "crypto")),
+    ("email", ("mail", "inbox")),
+)
+
+
+def _is_google_host(host):
+    return (
+        host == "google.com"
+        or host.startswith("google.")
+        or ".google." in host
+        or host.endswith(".google.com")
+    )
+
+
+def _google_path_category(host, path):
+    if not _is_google_host(host):
+        return None
+    if path.startswith(("/maps", "/travel", "/flights")):
+        return "travel"
+    if path.startswith("/shopping"):
+        return "shopping"
+    if path.startswith("/finance"):
+        return "finance"
+    if path.startswith("/news"):
+        return "news"
+    if path.startswith("/mail"):
+        return "email"
+    return None
+
+
+def classify_host(host):
+    """Return a category id for a hostname (www. prefix already stripped)."""
+    if not host:
+        return "other"
+    labels = host.split(".")
+    for i in range(len(labels)):
+        suffix = ".".join(labels[i:])
+        mapped = SITE_DOMAINS.get(suffix)
+        if mapped:
+            return mapped
+    for label in labels:
+        mapped = SITE_BRANDS.get(label)
+        if mapped:
+            return mapped
+    for cat, keys in _HOST_KEYWORDS:
+        if any(key in host for key in keys):
+            return cat
+    return "other"
+
+
+def classify_url(url):
+    """Return a tab-group category id for a page URL."""
+    if not url:
+        return "other"
+    qurl = QUrl(url)
+    host = (qurl.host() or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = (qurl.path() or "").lower()
+    google_cat = _google_path_category(host, path)
+    if google_cat:
+        return google_cat
+    return classify_host(host)
+
+
+def category_color(cat):
+    return TAB_CATEGORY_INFO.get(cat, TAB_CATEGORY_INFO["other"])[1]
+
+
+def category_label(cat):
+    return TAB_CATEGORY_INFO.get(cat, TAB_CATEGORY_INFO["other"])[0]
+
+
+class _GroupDot(QWidget):
+    """Tiny colored disc shown on the left of a grouped tab."""
+
+    def __init__(self, color, parent=None):
+        super().__init__(parent)
+        self._color = QColor(color)
+        self.setFixedSize(10, 10)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._color)
+        painter.drawEllipse(1, 1, 8, 8)
+
+
+class GroupedTabBar(QTabBar):
+    """Tab bar that paints a category-colored bar under consecutive groups."""
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        count = self.count()
+        if count == 0:
+            return
+        painter = QPainter(self)
+        painter.setPen(Qt.PenStyle.NoPen)
+        index = 0
+        while index < count:
+            cat = self.tabData(index) or "other"
+            end = index + 1
+            while end < count and (self.tabData(end) or "other") == cat:
+                end += 1
+            left = self.tabRect(index)
+            right = self.tabRect(end - 1)
+            painter.setBrush(QColor(category_color(cat)))
+            painter.drawRect(
+                left.x() + 2,
+                left.bottom() - 3,
+                max(0, right.right() - left.x() - 3),
+                3,
+            )
+            index = end
+
+
+class TabGroupStrip(QWidget):
+    """Row of colored chips for the site-type groups present in open tabs."""
+
+    group_selected = pyqtSignal(str)
+    close_group_requested = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._buttons = []
+        self.setObjectName("TabGroupStrip")
+        self.setStyleSheet(
+            "#TabGroupStrip { background: #f4f5f7; border-bottom: 1px solid #e4e7ec; }"
+        )
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(6)
+        hint = QLabel("Groups")
+        hint.setStyleSheet("color: #667085; font-size: 11px; background: transparent;")
+        layout.addWidget(hint)
+        layout.addStretch(1)
+        self._layout = layout
+        self.hide()
+
+    def update_groups(self, groups, current_cat):
+        for btn in self._buttons:
+            btn.deleteLater()
+        self._buttons = []
+        if not groups:
+            self.hide()
+            return
+        self.show()
+        for offset, (cat, count) in enumerate(groups):
+            label, color = TAB_CATEGORY_INFO.get(cat, TAB_CATEGORY_INFO["other"])
+            btn = QPushButton(f"{label} ({count})")
+            btn.setCheckable(True)
+            btn.setChecked(cat == current_cat)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setProperty("category", cat)
+            btn.setToolTip(
+                f"Jump to {label} tabs. Right-click to close this group."
+            )
+            btn.setStyleSheet(
+                "QPushButton { background: #ffffff; border: 1px solid #d0d5dd;"
+                f" border-left: 4px solid {color}; border-radius: 4px;"
+                " padding: 3px 10px; font-size: 11px; }"
+                f"QPushButton:checked {{ background: {color}22; font-weight: 600; }}"
+                f"QPushButton:hover {{ background: {color}18; }}"
+            )
+            btn.clicked.connect(lambda _checked=False, c=cat: self.group_selected.emit(c))
+            btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            btn.customContextMenuRequested.connect(
+                lambda pos, c=cat, b=btn: self._chip_menu(b, pos, c)
+            )
+            self._layout.insertWidget(offset + 1, btn)
+            self._buttons.append(btn)
+
+    def set_current(self, cat):
+        for btn in self._buttons:
+            btn.setChecked(btn.property("category") == cat)
+
+    def _chip_menu(self, btn, pos, cat):
+        menu = QMenu(self)
+        jump = menu.addAction("Jump to group")
+        close = menu.addAction("Close tabs in this group")
+        chosen = menu.exec(btn.mapToGlobal(pos))
+        if chosen is jump:
+            self.group_selected.emit(cat)
+        elif chosen is close:
+            self.close_group_requested.emit(cat)
+
+
 # --------------------------------------------------------------------- agent
 AGENT_SYSTEM_PROMPT = """You are an autonomous web-browsing agent that controls a \
 real web browser to accomplish a user's goal.
@@ -1109,11 +1472,27 @@ class BrowserWindow(QMainWindow):
         self._migrate_settings()
 
         self.tabs = QTabWidget()
+        self.tabs.setTabBar(GroupedTabBar(self.tabs))
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.tabs.currentChanged.connect(self.on_tab_changed)
-        self.setCentralWidget(self.tabs)
+
+        self.group_strip = TabGroupStrip()
+        self.group_strip.group_selected.connect(self._jump_to_tab_group)
+        self.group_strip.close_group_requested.connect(self._close_tab_group)
+
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self.group_strip)
+        central_layout.addWidget(self.tabs, 1)
+        self.setCentralWidget(central)
+
+        self._organize_timer = QTimer(self)
+        self._organize_timer.setSingleShot(True)
+        self._organize_timer.timeout.connect(self._organize_tabs)
 
         self.agent = BrowserAgent(self)
 
@@ -1192,6 +1571,20 @@ class BrowserWindow(QMainWindow):
 
         self.view_menu = QMenu("View", self)
         menubar.addMenu(self.view_menu)
+
+        self.auto_organize_action = QAction("Auto-organize tabs by site type", self)
+        self.auto_organize_action.setCheckable(True)
+        self.auto_organize_action.setChecked(
+            self.settings.get("auto_organize_tabs", True)
+        )
+        self.auto_organize_action.toggled.connect(self._toggle_auto_organize)
+        self.view_menu.addAction(self.auto_organize_action)
+
+        organize_now = QAction("Organize Tabs Now", self)
+        organize_now.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        organize_now.triggered.connect(lambda: self._organize_tabs_now())
+        self.view_menu.addAction(organize_now)
+        self.view_menu.addSeparator()
 
         self.apps_menu = QMenu("Apps", self)
         menubar.addMenu(self.apps_menu)
@@ -1355,6 +1748,7 @@ class BrowserWindow(QMainWindow):
         view.loadStarted.connect(lambda v=view: self._on_load_started(v))
         view.loadProgress.connect(lambda p, v=view: self._on_load_progress(p, v))
         view.loadFinished.connect(lambda ok, v=view: self._on_load_finished(ok, v))
+        self._schedule_organize()
 
     def current_view(self) -> QWebEngineView:
         return self.tabs.currentWidget()
@@ -1366,6 +1760,149 @@ class BrowserWindow(QMainWindow):
         widget = self.tabs.widget(index)
         self.tabs.removeTab(index)
         widget.deleteLater()
+        self._schedule_organize()
+
+    def _schedule_organize(self):
+        self._organize_timer.start(250)
+
+    def _toggle_auto_organize(self, enabled):
+        self.settings["auto_organize_tabs"] = bool(enabled)
+        _save_json(SETTINGS_FILE, self.settings)
+        if enabled:
+            self._organize_tabs(force=True)
+        else:
+            self._refresh_tab_groups()
+
+    def _organize_tabs_now(self):
+        self._organize_tabs(force=True)
+        self.statusBar().showMessage("Tabs organized by site type", 2500)
+
+    def _tab_categories(self):
+        cats = []
+        for i in range(self.tabs.count()):
+            view = self.tabs.widget(i)
+            url = view.url().toString() if view is not None else ""
+            cats.append(classify_url(url))
+        return cats
+
+    def _organize_tabs(self, force=False):
+        if self.tabs.count() == 0:
+            self.group_strip.update_groups([], None)
+            return
+        cats = self._tab_categories()
+        auto = self.settings.get("auto_organize_tabs", True)
+        if auto or force:
+            rank = {name: idx for idx, name in enumerate(TAB_CATEGORY_ORDER)}
+            current = self.tabs.currentWidget()
+            original = list(range(len(cats)))
+            desired = sorted(
+                original, key=lambda i: rank.get(cats[i], len(rank))
+            )
+            if desired != original:
+                self._reorder_tabs(desired, current)
+                cats = [cats[i] for i in desired]
+        self._refresh_tab_groups(cats)
+
+    def _reorder_tabs(self, desired_indices, current_widget):
+        snapshots = []
+        for i in range(self.tabs.count()):
+            snapshots.append(
+                (
+                    self.tabs.widget(i),
+                    self.tabs.tabText(i),
+                    self.tabs.tabIcon(i),
+                    self.tabs.tabToolTip(i),
+                )
+            )
+        self.tabs.blockSignals(True)
+        while self.tabs.count():
+            self.tabs.removeTab(0)
+        for i in desired_indices:
+            widget, text, icon, tip = snapshots[i]
+            index = self.tabs.addTab(widget, icon, text)
+            self.tabs.setTabToolTip(index, tip)
+        if current_widget is not None:
+            self.tabs.setCurrentWidget(current_widget)
+        self.tabs.blockSignals(False)
+
+    def _refresh_tab_groups(self, cats=None):
+        if cats is None:
+            cats = self._tab_categories()
+        tab_bar = self.tabs.tabBar()
+        counts = {}
+        for i, cat in enumerate(cats):
+            meta_label = category_label(cat)
+            color = category_color(cat)
+            tab_bar.setTabData(i, cat)
+            tab_bar.setTabTextColor(i, QColor(color))
+            title = self.tabs.tabText(i)
+            self.tabs.setTabToolTip(i, f"{meta_label} · {title}")
+            tab_bar.setTabButton(
+                i, QTabBar.ButtonPosition.LeftSide, _GroupDot(color)
+            )
+            counts[cat] = counts.get(cat, 0) + 1
+        groups = [(c, counts[c]) for c in TAB_CATEGORY_ORDER if c in counts]
+        current = None
+        index = self.tabs.currentIndex()
+        if 0 <= index < len(cats):
+            current = cats[index]
+        self.group_strip.update_groups(groups, current)
+        tab_bar.update()
+
+    def _highlight_current_group(self):
+        index = self.tabs.currentIndex()
+        if index < 0:
+            return
+        cat = self.tabs.tabBar().tabData(index)
+        if not cat:
+            view = self.tabs.widget(index)
+            url = view.url().toString() if view is not None else ""
+            cat = classify_url(url)
+        self.group_strip.set_current(cat)
+
+    def _jump_to_tab_group(self, cat):
+        count = self.tabs.count()
+        if count <= 0:
+            return
+        current = self.tabs.currentIndex()
+        current_cat = self.tabs.tabBar().tabData(current) or "other"
+        if current_cat == cat:
+            start = current + 1
+            for offset in range(count):
+                index = (start + offset) % count
+                if (self.tabs.tabBar().tabData(index) or "other") == cat:
+                    self.tabs.setCurrentIndex(index)
+                    return
+            return
+        for index in range(count):
+            if (self.tabs.tabBar().tabData(index) or "other") == cat:
+                self.tabs.setCurrentIndex(index)
+                return
+
+    def _close_tab_group(self, cat):
+        indices = []
+        for i in range(self.tabs.count()):
+            data = self.tabs.tabBar().tabData(i)
+            if not data:
+                view = self.tabs.widget(i)
+                url = view.url().toString() if view is not None else ""
+                data = classify_url(url)
+            if data == cat:
+                indices.append(i)
+        if not indices:
+            return
+        if self.tabs.count() - len(indices) < 1:
+            indices = indices[:-1]
+        if not indices:
+            return
+        self._organize_timer.stop()
+        for i in reversed(indices):
+            if self.tabs.count() <= 1:
+                break
+            widget = self.tabs.widget(i)
+            self.tabs.removeTab(i)
+            widget.deleteLater()
+        self._organize_tabs()
 
     # ----------------------------------------------------------- navigation
     def go_home(self):
@@ -1389,6 +1926,7 @@ class BrowserWindow(QMainWindow):
             self.url_bar.setText(view.url().toString())
             self.update_window_title(view.title())
         self._attach_inspector()
+        self._highlight_current_group()
 
     def on_url_changed(self, qurl: QUrl, view: QWebEngineView):
         if qurl.toString().startswith(("http://", "https://")):
@@ -1396,12 +1934,17 @@ class BrowserWindow(QMainWindow):
         if view is self.current_view():
             self.url_bar.setText(qurl.toString())
             self.url_bar.setCursorPosition(0)
+        self._schedule_organize()
 
     def on_title_changed(self, title: str, view: QWebEngineView):
         index = self.tabs.indexOf(view)
         if index != -1:
             label = title if title else "New Tab"
             self.tabs.setTabText(index, label[:24])
+            cat = self.tabs.tabBar().tabData(index) or classify_url(
+                view.url().toString()
+            )
+            self.tabs.setTabToolTip(index, f"{category_label(cat)} · {label}")
         if view is self.current_view():
             self.update_window_title(title)
 
@@ -1638,6 +2181,7 @@ class BrowserWindow(QMainWindow):
         self.settings.setdefault("provider", DEFAULT_PROVIDER)
         self.settings.setdefault("keys", {})
         self.settings.setdefault("models", {})
+        self.settings.setdefault("auto_organize_tabs", True)
         # Migrate the old single-provider schema (api_key/model -> OpenAI).
         if "api_key" in self.settings:
             self.settings["keys"].setdefault("openai", self.settings.pop("api_key"))
