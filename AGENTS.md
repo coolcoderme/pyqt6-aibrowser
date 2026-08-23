@@ -2,26 +2,48 @@
 
 ## Cursor Cloud specific instructions
 
-`browserdemo.py` is a single-file **PyQt6 + QtWebEngine desktop web browser** (with an optional LLM browsing agent). There is no server, database, port, or build step — it is run directly as a GUI application.
+`browserdemo.py` is a **PyQt6 desktop browser** whose pages are rendered by a
+local **Blink (Chromium)** process in [`blinkengine/`](blinkengine/). There is
+no HTTP server, database, or build step.
 
 ### Running the app
 
-- Run it against the live VNC display, which is where computer-use / manual testing observes the GUI:
+- Chromium/Chrome must be installed (`google-chrome` is present in this
+  environment). Override the binary with `CHROME_PATH` if needed.
+- Run it against the live VNC display:
   - `DISPLAY=:1 python3 browserdemo.py`
-- The window title becomes `<page title> - PyQt6 Browser` once loaded (home page is Google).
-- On startup you will see non-fatal `Failed to create Vulkan instance` / GPU `ContextResult::kTransientFailure` messages. These are expected in this headless-GPU VM; QtWebEngine falls back to software rendering and pages still render correctly. Do not treat them as failures.
-- Runtime state (bookmarks, history, settings, cookies, Qt profile) is written to `browser_data/` next to the script (git-ignored).
+- The window title becomes `<page title> - PyQt6 Browser` once loaded.
+- Startup may print Chromium GPU warnings; the engine is launched headless
+  with `--disable-gpu` and pages still render via CDP screencast. Do not
+  treat those messages as failures.
+- Runtime state (WebBoxes, history, settings, Blink profile, extensions)
+  is written to `browser_data/` next to the script (git-ignored).
+
+### Features
+
+- Tabs are auto-grouped by site type. Manual assignment is under
+  **View → Assign current tab to** and the tab context menu.
+- Bookmarks are called **WebBoxes** (Favorite / Miscellaneous).
+- **Settings → Preferences** chooses the search engine (Home / new tab /
+  address-bar search).
+- **File → New Insecret Window** (`Ctrl+Shift+N`) is a private session.
+- **Apps** can open the Chrome Web Store and install an extension from a
+  store detail page (CRX unpack + `--load-extension`).
 
 ### Non-obvious gotchas
 
-- The left "Library" sidebar's Bookmarks list does not always repaint immediately after adding a bookmark. The bookmark is still saved to `browser_data/bookmarks.json` right away — switching the sidebar between the History and Bookmarks tabs forces it to refresh. Prefer verifying persistence via `browser_data/bookmarks.json` / `history.json` rather than relying solely on the sidebar visual.
+- The left Library sidebar's WebBoxes list may not repaint immediately
+  after adding one. Persistence is in `browser_data/bookmarks.json` —
+  switching Library tabs forces a refresh.
+- Installing or removing an extension restarts the Chromium process and
+  reloads open tabs.
 
 ### Lint
 
-- Two linters are configured; run them via the module form so they work regardless of PATH:
-  - `python3 -m flake8 browserdemo.py` (config: `.flake8`)
-  - `python3 -m pylint browserdemo.py` (config: `.pylintrc`)
-- Note: the current committed code already has some pre-existing findings (e.g. `E501` long lines from flake8; pylint rates ~9.93/10 and exits non-zero due to convention/warning messages). These are baseline, not introduced by setup.
+- `python3 -m flake8 browserdemo.py blinkengine` (config: `.flake8`)
+- `python3 -m pylint browserdemo.py blinkengine` (config: `.pylintrc`)
+- Baseline: flake8 `E501` on the offline-page HTML; pylint ~9.9/10 and
+  may exit non-zero on convention messages.
 
 ### Tests / build
 
@@ -29,4 +51,6 @@
 
 ### Optional LLM agent
 
-- The right-hand "AI Agent" panel calls external LLM APIs (OpenAI, Anthropic, Google, Groq, OpenRouter, Featherless, Azure) and requires an API key set in-app; it is optional and the browser works fully without it. The "Cursor SDK" provider additionally requires `pip install cursor-sdk`.
+- The right-hand "AI Agent" panel calls external LLM APIs and needs an
+  API key set in-app. The "Cursor SDK" provider additionally requires
+  `pip install cursor-sdk`.

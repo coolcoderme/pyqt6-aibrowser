@@ -1,6 +1,8 @@
-# Runtime dependencies for browserdemo.py (PyQt6 desktop browser + LLM agent)
+# Runtime dependencies for browserdemo.py (PyQt6 chrome + Blink/Chromium engine)
 PyQt6
-PyQt6-WebEngine
+
+# Google Chrome or Chromium is required on the system PATH (or set CHROME_PATH).
+# The Python UI talks to it over the Chrome DevTools Protocol.
 
 # Lint tooling (configured by .flake8 and .pylintrc)
 flake8
