@@ -1,9 +1,9 @@
-"""A tabbed web browser built with PyQt6 and QtWebEngine.
+"""A tabbed web browser with a Python Blink (Chromium) engine.
 
-Features: tabs, automatic tab groups by site type (shopping, travel, …),
-navigation, smart address bar, persistent cookies, bookmarks, browsing
-history, a page-load progress bar, a library sidebar, download handling,
-and an LLM-powered browsing agent.
+Features: tabs, automatic and manual tab groups by site type, navigation,
+smart address bar, WebBoxes, browsing history, a library sidebar, download
+handling, Chrome Web Store extensions, Insecret windows, and an optional
+LLM-powered browsing agent.
 """
 
 import json
@@ -17,18 +17,14 @@ from datetime import datetime
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QKeySequence, QPainter
-from PyQt6.QtWebEngineCore import (
-    QWebEngineDownloadRequest,
-    QWebEnginePage,
-    QWebEngineProfile,
-    QWebEngineSettings,
-)
-from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -48,13 +44,73 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from blinkengine import (
+    BlinkHost,
+    BlinkView,
+    install_from_store_url,
+    list_extensions,
+    parse_store_id,
+    remove_extension,
+)
+from blinkengine.host import make_insecret_dir
+
 HOME_URL = "https://www.google.com"
+WEBBOX_FAVORITE = "favorite"
+WEBBOX_MISC = "miscellaneous"
+
+SEARCH_ENGINES = {
+    "google": {
+        "label": "Google",
+        "home": "https://www.google.com",
+        "search": "https://www.google.com/search?q={query}",
+    },
+    "duckduckgo": {
+        "label": "DuckDuckGo",
+        "home": "https://duckduckgo.com",
+        "search": "https://duckduckgo.com/?q={query}",
+    },
+    "bing": {
+        "label": "Bing",
+        "home": "https://www.bing.com",
+        "search": "https://www.bing.com/search?q={query}",
+    },
+    "yahoo": {
+        "label": "Yahoo",
+        "home": "https://www.yahoo.com",
+        "search": "https://search.yahoo.com/search?p={query}",
+    },
+    "ecosia": {
+        "label": "Ecosia",
+        "home": "https://www.ecosia.org",
+        "search": "https://www.ecosia.org/search?q={query}",
+    },
+    "startpage": {
+        "label": "Startpage",
+        "home": "https://www.startpage.com",
+        "search": "https://www.startpage.com/sp/search?query={query}",
+    },
+    "brave": {
+        "label": "Brave",
+        "home": "https://search.brave.com",
+        "search": "https://search.brave.com/search?q={query}",
+    },
+}
+SEARCH_ENGINE_ORDER = [
+    "google",
+    "duckduckgo",
+    "bing",
+    "yahoo",
+    "ecosia",
+    "startpage",
+    "brave",
+]
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_data")
 BOOKMARKS_FILE = os.path.join(DATA_DIR, "bookmarks.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 PROFILE_DIR = os.path.join(DATA_DIR, "profile")
+BLINK_PROFILE_DIR = os.path.join(DATA_DIR, "blink_profile")
 
 MAX_HISTORY = 1000
 AGENT_MAX_STEPS = 10
@@ -1449,27 +1505,87 @@ class BrowserAgent(QObject):
         )
 
 
-class BrowserWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("PyQt6 Browser")
-        self.resize(1280, 820)
+class WebBoxDialog(QDialog):
+    """Create or classify a WebBox (favorite or miscellaneous)."""
 
-        os.makedirs(PROFILE_DIR, exist_ok=True)
-
-        # Persistent profile so cookies, cache and logins survive restarts.
-        self.profile = QWebEngineProfile("pyqt6-browser", self)
-        self.profile.setPersistentStoragePath(PROFILE_DIR)
-        self.profile.setCachePath(os.path.join(PROFILE_DIR, "cache"))
-        self.profile.setPersistentCookiesPolicy(
-            QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies
+    def __init__(self, parent, title="", url="", kind=WEBBOX_FAVORITE):
+        super().__init__(parent)
+        self.setWindowTitle("New WebBox")
+        layout = QFormLayout(self)
+        self.title_edit = QLineEdit(title)
+        self.url_edit = QLineEdit(url)
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItem("Favorite WebBox", WEBBOX_FAVORITE)
+        self.kind_combo.addItem("Miscellaneous WebBox", WEBBOX_MISC)
+        idx = self.kind_combo.findData(kind)
+        if idx >= 0:
+            self.kind_combo.setCurrentIndex(idx)
+        layout.addRow("Title:", self.title_edit)
+        layout.addRow("Address:", self.url_edit)
+        layout.addRow("Type:", self.kind_combo)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        self.profile.downloadRequested.connect(self._on_download_requested)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
 
-        self.bookmarks = _load_json(BOOKMARKS_FILE, [])
-        self.history = _load_json(HISTORY_FILE, [])
+    def values(self):
+        return (
+            self.title_edit.text().strip(),
+            self.url_edit.text().strip(),
+            self.kind_combo.currentData() or WEBBOX_MISC,
+        )
+
+
+class SettingsDialog(QDialog):
+    """Application preferences (search engine)."""
+
+    def __init__(self, parent, current_engine="google"):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        layout = QFormLayout(self)
+        self.engine_combo = QComboBox()
+        for key in SEARCH_ENGINE_ORDER:
+            self.engine_combo.addItem(SEARCH_ENGINES[key]["label"], key)
+        idx = self.engine_combo.findData(current_engine)
+        if idx >= 0:
+            self.engine_combo.setCurrentIndex(idx)
+        layout.addRow("Search engine:", self.engine_combo)
+        hint = QLabel("Used for Home, new tabs, and the address-bar search box.")
+        hint.setStyleSheet("color: #667085;")
+        hint.setWordWrap(True)
+        layout.addRow(hint)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def search_engine(self):
+        return self.engine_combo.currentData() or "google"
+
+
+class BrowserWindow(QMainWindow):
+    _windows = []
+    _shared_host = None
+
+    def __init__(self, insecret=False):
+        super().__init__()
+        self.insecret = insecret
+        self.setWindowTitle("PyQt6 Browser" + (" - Insecret" if insecret else ""))
+        self.resize(1280, 820)
+        BrowserWindow._windows.append(self)
+
+        os.makedirs(DATA_DIR, exist_ok=True)
+        self._start_blink_host()
+
+        self.bookmarks = [] if insecret else _load_json(BOOKMARKS_FILE, [])
+        self.history = [] if insecret else _load_json(HISTORY_FILE, [])
         self.settings = _load_json(SETTINGS_FILE, {})
         self._migrate_settings()
+        self._migrate_webboxes()
 
         self.tabs = QTabWidget()
         self.tabs.setTabBar(GroupedTabBar(self.tabs))
@@ -1477,6 +1593,8 @@ class BrowserWindow(QMainWindow):
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.tabs.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tabs.tabBar().customContextMenuRequested.connect(self._tab_bar_menu)
 
         self.group_strip = TabGroupStrip()
         self.group_strip.group_selected.connect(self._jump_to_tab_group)
@@ -1510,7 +1628,29 @@ class BrowserWindow(QMainWindow):
         self._dino_filter_timer = QTimer(self)
         self._dino_filter_timer.timeout.connect(self._refresh_dino_filter)
         self._dino_filter_timer.start(300)
-        self.add_tab(QUrl(HOME_URL))
+        self.add_tab(QUrl(self.home_url()))
+
+    def _start_blink_host(self):
+        try:
+            if self.insecret:
+                self.host = BlinkHost(make_insecret_dir(), self, insecret=True)
+                self.host.start()
+            else:
+                host = BrowserWindow._shared_host
+                if host is None:
+                    host = BlinkHost(BLINK_PROFILE_DIR)
+                    host.start()
+                    BrowserWindow._shared_host = host
+                self.host = host
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Blink engine",
+                "Could not start Chromium:\n%s" % exc,
+            )
+            raise
+        self.host.download_requested.connect(self._on_download_requested)
+        self.host.download_finished.connect(self._on_host_download_finished)
 
     # ------------------------------------------------------------------ UI
     def _build_toolbar(self):
@@ -1529,11 +1669,13 @@ class BrowserWindow(QMainWindow):
         nav.addAction(forward)
 
         reload = QAction("Reload", self)
-        reload.setShortcut(QKeySequence.StandardKey.Refresh)
+        reload.setShortcut(QKeySequence("Ctrl+R"))
+        reload.setShortcuts([QKeySequence("Ctrl+R"), QKeySequence.StandardKey.Refresh])
         reload.triggered.connect(lambda: self.current_view().reload())
         nav.addAction(reload)
 
         home = QAction("Home", self)
+        home.setShortcut(QKeySequence("Alt+Home"))
         home.triggered.connect(self.go_home)
         nav.addAction(home)
 
@@ -1543,14 +1685,14 @@ class BrowserWindow(QMainWindow):
         self.url_bar.returnPressed.connect(self.navigate_to_url)
         nav.addWidget(self.url_bar)
 
-        star = QAction("\u2606 Bookmark", self)
+        star = QAction("\u2606 WebBox", self)
         star.setShortcut(QKeySequence("Ctrl+D"))
-        star.triggered.connect(self.add_bookmark)
+        star.triggered.connect(lambda: self.add_webbox(WEBBOX_FAVORITE))
         nav.addAction(star)
 
         new_tab = QAction("New Tab", self)
-        new_tab.setShortcut(QKeySequence.StandardKey.AddTab)
-        new_tab.triggered.connect(lambda: self.add_tab(QUrl(HOME_URL)))
+        new_tab.setShortcut(QKeySequence("Ctrl+T"))
+        new_tab.triggered.connect(lambda: self.add_tab(QUrl(self.home_url())))
         nav.addAction(new_tab)
 
         inspect = QAction("Inspect", self)
@@ -1561,7 +1703,26 @@ class BrowserWindow(QMainWindow):
     def _build_menus(self):
         menubar = self.menuBar()
 
-        self.bookmarks_menu = QMenu("Bookmarks", self)
+        file_menu = QMenu("File", self)
+        menubar.addMenu(file_menu)
+        new_tab = file_menu.addAction("New Tab")
+        new_tab.setShortcut(QKeySequence("Ctrl+T"))
+        new_tab.triggered.connect(lambda: self.add_tab(QUrl(self.home_url())))
+        new_win = file_menu.addAction("New Window")
+        new_win.setShortcut(QKeySequence("Ctrl+N"))
+        new_win.triggered.connect(self._new_window)
+        insecret = file_menu.addAction("New Insecret Window")
+        insecret.setShortcut(QKeySequence("Ctrl+Shift+N"))
+        insecret.triggered.connect(self._new_insecret_window)
+        close_tab = file_menu.addAction("Close Tab")
+        close_tab.setShortcut(QKeySequence("Ctrl+W"))
+        close_tab.triggered.connect(lambda: self.close_tab(self.tabs.currentIndex()))
+        file_menu.addSeparator()
+        focus_url = file_menu.addAction("Focus Address Bar")
+        focus_url.setShortcut(QKeySequence("Ctrl+L"))
+        focus_url.triggered.connect(self.url_bar.setFocus)
+
+        self.bookmarks_menu = QMenu("WebBoxes", self)
         menubar.addMenu(self.bookmarks_menu)
         self.bookmarks_menu.aboutToShow.connect(self._rebuild_bookmarks_menu)
 
@@ -1584,14 +1745,33 @@ class BrowserWindow(QMainWindow):
         organize_now.setShortcut(QKeySequence("Ctrl+Shift+O"))
         organize_now.triggered.connect(lambda: self._organize_tabs_now())
         self.view_menu.addAction(organize_now)
+
+        assign_menu = self.view_menu.addMenu("Assign current tab to")
+        for cat in TAB_CATEGORY_ORDER:
+            action = assign_menu.addAction(category_label(cat))
+            action.triggered.connect(
+                lambda _checked=False, c=cat: self._assign_tab_group(c)
+            )
+        clear_group = self.view_menu.addAction("Clear manual group on this tab")
+        clear_group.triggered.connect(self._clear_manual_group)
         self.view_menu.addSeparator()
+
+        next_tab = self.view_menu.addAction("Next Tab")
+        next_tab.setShortcut(QKeySequence("Ctrl+Tab"))
+        next_tab.triggered.connect(self._next_tab)
+        prev_tab = self.view_menu.addAction("Previous Tab")
+        prev_tab.setShortcut(QKeySequence("Ctrl+Shift+Tab"))
+        prev_tab.triggered.connect(self._prev_tab)
+        self.view_menu.addSeparator()
+
+        self.settings_menu = QMenu("Settings", self)
+        menubar.addMenu(self.settings_menu)
+        prefs = self.settings_menu.addAction("Preferences…")
+        prefs.triggered.connect(self._open_settings)
 
         self.apps_menu = QMenu("Apps", self)
         menubar.addMenu(self.apps_menu)
-        store = self.apps_menu.addAction("Open Chrome Web Store")
-        store.triggered.connect(
-            lambda: self.add_tab(QUrl(CHROME_WEB_STORE_URL))
-        )
+        self.apps_menu.aboutToShow.connect(self._rebuild_apps_menu)
 
     def _build_statusbar(self):
         self.progress = QProgressBar()
@@ -1610,7 +1790,7 @@ class BrowserWindow(QMainWindow):
 
         self.bookmarks_list = QListWidget()
         self.bookmarks_list.itemActivated.connect(self._open_list_item)
-        tabs.addTab(self.bookmarks_list, "Bookmarks")
+        tabs.addTab(self.bookmarks_list, "WebBoxes")
 
         self.history_list = QListWidget()
         self.history_list.itemActivated.connect(self._open_list_item)
@@ -1699,46 +1879,53 @@ class BrowserWindow(QMainWindow):
             Qt.DockWidgetArea.BottomDockWidgetArea
             | Qt.DockWidgetArea.RightDockWidgetArea
         )
-        self.devtools_view = QWebEngineView()
-        self.devtools_view.setPage(QWebEnginePage(self.profile, self.devtools_view))
-        dock.setWidget(self.devtools_view)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        self.inspector_log = QTextEdit()
+        self.inspector_log.setReadOnly(True)
+        self.inspector_log.setPlaceholderText("JavaScript results appear here.")
+        self.inspector_input = QLineEdit()
+        self.inspector_input.setPlaceholderText("Evaluate JavaScript on this page")
+        self.inspector_input.returnPressed.connect(self._run_inspector_js)
+        layout.addWidget(self.inspector_log, 1)
+        layout.addWidget(self.inspector_input)
+        dock.setWidget(container)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
         dock.hide()
         self.inspector_dock = dock
         self.view_menu.addAction(dock.toggleViewAction())
-        dock.visibilityChanged.connect(self._on_inspector_visibility)
 
     def toggle_inspector(self):
         if self.inspector_dock.isVisible():
             self.inspector_dock.hide()
         else:
             self.inspector_dock.show()
-            self._attach_inspector()
+            self.inspector_input.setFocus()
 
     def _on_inspector_visibility(self, visible):
         if visible:
-            self._attach_inspector()
+            self.inspector_input.setFocus()
 
     def _attach_inspector(self):
-        if not getattr(self, "inspector_dock", None) or not self.inspector_dock.isVisible():
-            return
+        return
+
+    def _run_inspector_js(self):
         view = self.current_view()
-        if view is not None and view is not self.devtools_view:
-            view.page().setDevToolsPage(self.devtools_view.page())
+        script = self.inspector_input.text().strip()
+        if view is None or not script:
+            return
+
+        def done(result):
+            self.inspector_log.append(f">>> {script}\n{result!r}")
+
+        view.page().runJavaScript(script, done)
 
     # ----------------------------------------------------------------- tabs
     def add_tab(self, url: QUrl):
-        view = QWebEngineView()
+        view = BlinkView(self.host)
         view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         view._dino_page = False
-        view.setPage(QWebEnginePage(self.profile, view))
-        settings = view.settings()
-        settings.setAttribute(
-            QWebEngineSettings.WebAttribute.ErrorPageEnabled, False
-        )
-        settings.setAttribute(
-            QWebEngineSettings.WebAttribute.FocusOnNavigationEnabled, True
-        )
+        view.manual_group = None
         view.setUrl(url)
         index = self.tabs.addTab(view, "New Tab")
         self.tabs.setCurrentIndex(index)
@@ -1750,7 +1937,7 @@ class BrowserWindow(QMainWindow):
         view.loadFinished.connect(lambda ok, v=view: self._on_load_finished(ok, v))
         self._schedule_organize()
 
-    def current_view(self) -> QWebEngineView:
+    def current_view(self) -> BlinkView:
         return self.tabs.currentWidget()
 
     def close_tab(self, index: int):
@@ -1759,7 +1946,9 @@ class BrowserWindow(QMainWindow):
             return
         widget = self.tabs.widget(index)
         self.tabs.removeTab(index)
-        widget.deleteLater()
+        if widget is not None:
+            widget.shutdown()
+            widget.deleteLater()
         self._schedule_organize()
 
     def _schedule_organize(self):
@@ -1781,6 +1970,10 @@ class BrowserWindow(QMainWindow):
         cats = []
         for i in range(self.tabs.count()):
             view = self.tabs.widget(i)
+            manual = getattr(view, "manual_group", None) if view is not None else None
+            if manual:
+                cats.append(manual)
+                continue
             url = view.url().toString() if view is not None else ""
             cats.append(classify_url(url))
         return cats
@@ -1905,8 +2098,19 @@ class BrowserWindow(QMainWindow):
         self._organize_tabs()
 
     # ----------------------------------------------------------- navigation
+    def home_url(self):
+        engine = self.settings.get("search_engine", "google")
+        meta = SEARCH_ENGINES.get(engine) or SEARCH_ENGINES["google"]
+        return meta["home"]
+
+    def search_url(self, text):
+        engine = self.settings.get("search_engine", "google")
+        meta = SEARCH_ENGINES.get(engine) or SEARCH_ENGINES["google"]
+        query = QUrl.toPercentEncoding(text).data().decode()
+        return meta["search"].format(query=query)
+
     def go_home(self):
-        self.current_view().setUrl(QUrl(HOME_URL))
+        self.current_view().setUrl(QUrl(self.home_url()))
 
     def navigate_to_url(self):
         text = self.url_bar.text().strip()
@@ -1915,8 +2119,7 @@ class BrowserWindow(QMainWindow):
         if "." in text and " " not in text:
             url = text if "://" in text else f"https://{text}"
         else:
-            query = QUrl.toPercentEncoding(text).data().decode()
-            url = f"https://www.google.com/search?q={query}"
+            url = self.search_url(text)
         self.current_view().setUrl(QUrl(url))
 
     # -------------------------------------------------------------- signals
@@ -1928,7 +2131,7 @@ class BrowserWindow(QMainWindow):
         self._attach_inspector()
         self._highlight_current_group()
 
-    def on_url_changed(self, qurl: QUrl, view: QWebEngineView):
+    def on_url_changed(self, qurl: QUrl, view: BlinkView):
         if qurl.toString().startswith(("http://", "https://")):
             view._dino_page = False
         if view is self.current_view():
@@ -1936,7 +2139,7 @@ class BrowserWindow(QMainWindow):
             self.url_bar.setCursorPosition(0)
         self._schedule_organize()
 
-    def on_title_changed(self, title: str, view: QWebEngineView):
+    def on_title_changed(self, title: str, view: BlinkView):
         index = self.tabs.indexOf(view)
         if index != -1:
             label = title if title else "New Tab"
@@ -2041,31 +2244,88 @@ class BrowserWindow(QMainWindow):
         )
 
     def update_window_title(self, title: str):
-        self.setWindowTitle(f"{title} - PyQt6 Browser" if title else "PyQt6 Browser")
+        suffix = " - Insecret" if self.insecret else ""
+        if title:
+            self.setWindowTitle(f"{title} - PyQt6 Browser{suffix}")
+        else:
+            self.setWindowTitle(f"PyQt6 Browser{suffix}")
 
-    # ------------------------------------------------------------ bookmarks
-    def add_bookmark(self):
+    # ------------------------------------------------------------ webboxes
+    def _migrate_webboxes(self):
+        changed = False
+        for item in self.bookmarks:
+            if "kind" not in item:
+                item["kind"] = WEBBOX_MISC
+                changed = True
+        if changed and not self.insecret:
+            _save_json(BOOKMARKS_FILE, self.bookmarks)
+
+    def add_webbox(self, kind=WEBBOX_FAVORITE):
+        if self.insecret:
+            self.statusBar().showMessage("WebBoxes are not saved in Insecret mode", 2500)
+            return
         view = self.current_view()
-        url = view.url().toString()
+        url = view.url().toString() if view is not None else ""
         if not url or url == "about:blank":
             return
-        title = view.title() or url
+        title = (view.title() if view is not None else "") or url
         if any(b["url"] == url for b in self.bookmarks):
-            self.statusBar().showMessage("Already bookmarked", 2000)
+            self.statusBar().showMessage("Already a WebBox", 2000)
             return
-        self.bookmarks.append({"title": title, "url": url})
+        self.bookmarks.append({"title": title, "url": url, "kind": kind})
         _save_json(BOOKMARKS_FILE, self.bookmarks)
         self.refresh_library()
-        self.statusBar().showMessage(f"Bookmarked: {title}", 2000)
+        label = "Favorite" if kind == WEBBOX_FAVORITE else "Miscellaneous"
+        self.statusBar().showMessage(f"{label} WebBox: {title}", 2000)
+
+    def _new_webbox_dialog(self):
+        view = self.current_view()
+        title = view.title() if view is not None else ""
+        url = view.url().toString() if view is not None else ""
+        dialog = WebBoxDialog(self, title, url, WEBBOX_FAVORITE)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        title, url, kind = dialog.values()
+        if not url:
+            return
+        if "://" not in url:
+            url = "https://" + url
+        if any(b["url"] == url for b in self.bookmarks):
+            self.statusBar().showMessage("Already a WebBox", 2000)
+            return
+        self.bookmarks.append(
+            {"title": title or url, "url": url, "kind": kind or WEBBOX_MISC}
+        )
+        if not self.insecret:
+            _save_json(BOOKMARKS_FILE, self.bookmarks)
+        self.refresh_library()
 
     def _rebuild_bookmarks_menu(self):
         self.bookmarks_menu.clear()
-        add = self.bookmarks_menu.addAction("Add current page  (Ctrl+D)")
-        add.triggered.connect(self.add_bookmark)
-        if self.bookmarks:
-            self.bookmarks_menu.addSeparator()
-        for bm in self.bookmarks:
-            entry = self.bookmarks_menu.addMenu(bm["title"][:40] or bm["url"])
+        create = self.bookmarks_menu.addAction("New WebBox…")
+        create.triggered.connect(self._new_webbox_dialog)
+        fav = self.bookmarks_menu.addAction("Add current as Favorite WebBox")
+        fav.setShortcut(QKeySequence("Ctrl+D"))
+        fav.triggered.connect(lambda: self.add_webbox(WEBBOX_FAVORITE))
+        misc = self.bookmarks_menu.addAction("Add current as Miscellaneous WebBox")
+        misc.triggered.connect(lambda: self.add_webbox(WEBBOX_MISC))
+        favorites = [b for b in self.bookmarks if b.get("kind") == WEBBOX_FAVORITE]
+        others = [b for b in self.bookmarks if b.get("kind") != WEBBOX_FAVORITE]
+        self.bookmarks_menu.addSeparator()
+        self._fill_webbox_submenu(
+            self.bookmarks_menu.addMenu("Favorite WebBoxes"), favorites
+        )
+        self._fill_webbox_submenu(
+            self.bookmarks_menu.addMenu("Miscellaneous WebBoxes"), others
+        )
+
+    def _fill_webbox_submenu(self, menu, items):
+        if not items:
+            empty = menu.addAction("(empty)")
+            empty.setEnabled(False)
+            return
+        for bm in items:
+            entry = menu.addMenu(bm["title"][:40] or bm["url"])
             open_action = entry.addAction("Open")
             open_action.triggered.connect(
                 lambda _checked, u=bm["url"]: self.current_view().setUrl(QUrl(u))
@@ -2081,11 +2341,14 @@ class BrowserWindow(QMainWindow):
 
     def _remove_bookmark(self, url):
         self.bookmarks = [b for b in self.bookmarks if b["url"] != url]
-        _save_json(BOOKMARKS_FILE, self.bookmarks)
+        if not self.insecret:
+            _save_json(BOOKMARKS_FILE, self.bookmarks)
         self.refresh_library()
 
     # -------------------------------------------------------------- history
     def _record_history(self, url, title):
+        if self.insecret:
+            return
         if not url or url == "about:blank":
             return
         if self.history and self.history[-1].get("url") == url:
@@ -2130,8 +2393,23 @@ class BrowserWindow(QMainWindow):
         if not hasattr(self, "bookmarks_list"):
             return
         self.bookmarks_list.clear()
-        for bm in self.bookmarks:
-            item = QListWidgetItem(bm.get("title") or bm.get("url"))
+        favorites = [b for b in self.bookmarks if b.get("kind") == WEBBOX_FAVORITE]
+        others = [b for b in self.bookmarks if b.get("kind") != WEBBOX_FAVORITE]
+        if favorites:
+            header = QListWidgetItem("Favorite WebBoxes")
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.bookmarks_list.addItem(header)
+        for bm in favorites:
+            item = QListWidgetItem("  " + (bm.get("title") or bm.get("url")))
+            item.setToolTip(bm.get("url", ""))
+            item.setData(ROLE_DATA, bm.get("url", ""))
+            self.bookmarks_list.addItem(item)
+        if others:
+            header = QListWidgetItem("Miscellaneous WebBoxes")
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.bookmarks_list.addItem(header)
+        for bm in others:
+            item = QListWidgetItem("  " + (bm.get("title") or bm.get("url")))
             item.setToolTip(bm.get("url", ""))
             item.setData(ROLE_DATA, bm.get("url", ""))
             self.bookmarks_list.addItem(item)
@@ -2163,18 +2441,10 @@ class BrowserWindow(QMainWindow):
         download.setDownloadDirectory(os.path.dirname(path))
         download.setDownloadFileName(os.path.basename(path))
         download.accept()
-        name = os.path.basename(path)
-        self.statusBar().showMessage(f"Downloading {name}\u2026")
-        download.isFinishedChanged.connect(
-            lambda d=download, n=name: self._on_download_finished(d, n)
-        )
+        self.statusBar().showMessage(f"Downloading {os.path.basename(path)}\u2026")
 
-    def _on_download_finished(self, download, name):
-        state = download.state()
-        if state == QWebEngineDownloadRequest.DownloadState.DownloadCompleted:
-            self.statusBar().showMessage(f"Downloaded {name}", 4000)
-        elif state == QWebEngineDownloadRequest.DownloadState.DownloadInterrupted:
-            self.statusBar().showMessage(f"Download failed: {name}", 4000)
+    def _on_host_download_finished(self):
+        self.statusBar().showMessage("Download finished", 4000)
 
     # ---------------------------------------------------------------- agent
     def _migrate_settings(self):
@@ -2182,6 +2452,7 @@ class BrowserWindow(QMainWindow):
         self.settings.setdefault("keys", {})
         self.settings.setdefault("models", {})
         self.settings.setdefault("auto_organize_tabs", True)
+        self.settings.setdefault("search_engine", "google")
         # Migrate the old single-provider schema (api_key/model -> OpenAI).
         if "api_key" in self.settings:
             self.settings["keys"].setdefault("openai", self.settings.pop("api_key"))
@@ -2191,6 +2462,146 @@ class BrowserWindow(QMainWindow):
         self.settings.setdefault("azure_deployment", "")
         self.settings.setdefault("azure_api_version", DEFAULT_AZURE_API_VERSION)
         _save_json(SETTINGS_FILE, self.settings)
+
+    def _new_window(self):
+        window = BrowserWindow(insecret=False)
+        window.show()
+
+    def _new_insecret_window(self):
+        window = BrowserWindow(insecret=True)
+        window.show()
+
+    def _open_settings(self):
+        dialog = SettingsDialog(self, self.settings.get("search_engine", "google"))
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.settings["search_engine"] = dialog.search_engine()
+        _save_json(SETTINGS_FILE, self.settings)
+        self.statusBar().showMessage(
+            "Search engine: " + SEARCH_ENGINES[self.settings["search_engine"]]["label"],
+            2500,
+        )
+
+    def _assign_tab_group(self, cat):
+        view = self.current_view()
+        if view is None:
+            return
+        view.manual_group = cat
+        self._organize_tabs(force=True)
+
+    def _clear_manual_group(self):
+        view = self.current_view()
+        if view is None:
+            return
+        view.manual_group = None
+        self._organize_tabs(force=True)
+
+    def _next_tab(self):
+        count = self.tabs.count()
+        if count:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() + 1) % count)
+
+    def _prev_tab(self):
+        count = self.tabs.count()
+        if count:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() - 1) % count)
+
+    def _tab_bar_menu(self, pos):
+        index = self.tabs.tabBar().tabAt(pos)
+        if index < 0:
+            return
+        self.tabs.setCurrentIndex(index)
+        menu = QMenu(self)
+        assign = menu.addMenu("Assign to group")
+        for cat in TAB_CATEGORY_ORDER:
+            action = assign.addAction(category_label(cat))
+            action.triggered.connect(
+                lambda _checked=False, c=cat: self._assign_tab_group(c)
+            )
+        menu.addAction("Clear manual group").triggered.connect(self._clear_manual_group)
+        menu.exec(self.tabs.tabBar().mapToGlobal(pos))
+
+    def _rebuild_apps_menu(self):
+        self.apps_menu.clear()
+        store = self.apps_menu.addAction("Open Chrome Web Store")
+        store.setToolTip(
+            "Blink loads unpacked Manifest extensions. Store-only APIs may differ."
+        )
+        store.triggered.connect(lambda: self.add_tab(QUrl(CHROME_WEB_STORE_URL)))
+        install = self.apps_menu.addAction("Install this extension")
+        current = ""
+        view = self.current_view()
+        if view is not None:
+            current = view.url().toString()
+        install.setEnabled(bool(parse_store_id(current)))
+        install.triggered.connect(self._install_current_extension)
+        self.apps_menu.addSeparator()
+        installed = list_extensions()
+        if not installed:
+            empty = self.apps_menu.addAction("(no extensions installed)")
+            empty.setEnabled(False)
+            return
+        for item in installed:
+            entry = self.apps_menu.addMenu(item.get("name") or item.get("id"))
+            remove = entry.addAction("Remove")
+            remove.triggered.connect(
+                lambda _checked=False, sid=item.get("id"): self._remove_extension(sid)
+            )
+
+    def _install_current_extension(self):
+        view = self.current_view()
+        if view is None:
+            return
+        url = view.url().toString()
+        try:
+            record = install_from_store_url(url)
+        except Exception as exc:
+            QMessageBox.warning(self, "Extension install failed", str(exc))
+            return
+        self._reload_blink_host()
+        self.statusBar().showMessage("Installed " + record.get("name", "extension"), 4000)
+
+    def _remove_extension(self, store_id):
+        if not store_id:
+            return
+        remove_extension(store_id)
+        self._reload_blink_host()
+        self.statusBar().showMessage("Extension removed", 2500)
+
+    def _reload_blink_host(self):
+        urls = []
+        current = self.tabs.currentIndex()
+        for i in range(self.tabs.count()):
+            view = self.tabs.widget(i)
+            urls.append(view.url() if view is not None else QUrl(self.home_url()))
+            if view is not None:
+                view.shutdown()
+        if self.host is BrowserWindow._shared_host:
+            self.host.restart()
+        else:
+            self.host.restart()
+        for i in range(self.tabs.count()):
+            view = self.tabs.widget(i)
+            if view is None:
+                continue
+            view.attach_target()
+            view.setUrl(urls[i])
+        self.tabs.setCurrentIndex(current)
+
+    def closeEvent(self, event):
+        for i in range(self.tabs.count()):
+            view = self.tabs.widget(i)
+            if view is not None:
+                view.shutdown()
+        if self in BrowserWindow._windows:
+            BrowserWindow._windows.remove(self)
+        if self.insecret:
+            self.host.stop()
+        elif not any(not w.insecret for w in BrowserWindow._windows):
+            if BrowserWindow._shared_host is not None:
+                BrowserWindow._shared_host.stop()
+                BrowserWindow._shared_host = None
+        event.accept()
 
     def _current_provider(self):
         return self.provider_combo.currentData() or DEFAULT_PROVIDER
