@@ -44,7 +44,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from pyblink import (
+from blinkengine import (
     BlinkHost,
     BlinkView,
     install_from_store_url,
@@ -52,7 +52,7 @@ from pyblink import (
     parse_store_id,
     remove_extension,
 )
-from pyblink.host import make_insecret_dir
+from blinkengine.host import make_insecret_dir
 
 HOME_URL = "https://www.google.com"
 WEBBOX_FAVORITE = "favorite"

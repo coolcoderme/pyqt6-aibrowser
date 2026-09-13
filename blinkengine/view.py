@@ -7,7 +7,7 @@ from PyQt6.QtCore import QByteArray, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import QImage, QPainter
 from PyQt6.QtWidgets import QWidget
 
-from pyblink.host import BlinkHost
+from blinkengine.host import BlinkHost
 
 
 class BlinkPage:
