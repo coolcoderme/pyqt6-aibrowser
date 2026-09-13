@@ -16,15 +16,17 @@ import urllib.request
 from datetime import datetime
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QKeySequence, QPainter
+from PyQt6.QtGui import QAction, QColor, QKeySequence, QPainter, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
+    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDockWidget,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -104,6 +106,95 @@ SEARCH_ENGINE_ORDER = [
     "startpage",
     "brave",
 ]
+
+THEME_PRESETS = {
+    "light": {
+        "label": "Light",
+        "window": "#f4f5f7",
+        "surface": "#ffffff",
+        "alt": "#eef0f3",
+        "text": "#1d2939",
+        "muted": "#667085",
+        "border": "#d0d5dd",
+        "highlight": "#2563eb",
+        "highlight_text": "#ffffff",
+        "button": "#ffffff",
+        "button_hover": "#f2f4f7",
+        "input": "#ffffff",
+        "tab_selected": "#ffffff",
+        "agent_user": "#2563eb",
+        "agent_thought": "#6b7280",
+        "agent_action": "#059669",
+        "agent_system": "#9333ea",
+        "agent_error": "#dc2626",
+        "agent_default": "#111827",
+    },
+    "dark": {
+        "label": "Dark",
+        "window": "#202124",
+        "surface": "#2b2c2f",
+        "alt": "#303134",
+        "text": "#e8eaed",
+        "muted": "#9aa0a6",
+        "border": "#3c4043",
+        "highlight": "#8ab4f8",
+        "highlight_text": "#202124",
+        "button": "#3c4043",
+        "button_hover": "#4a4d51",
+        "input": "#303134",
+        "tab_selected": "#303134",
+        "agent_user": "#8ab4f8",
+        "agent_thought": "#9aa0a6",
+        "agent_action": "#81c995",
+        "agent_system": "#c58af9",
+        "agent_error": "#f28b82",
+        "agent_default": "#e8eaed",
+    },
+    "midnight": {
+        "label": "Midnight",
+        "window": "#0f172a",
+        "surface": "#1e293b",
+        "alt": "#1e293b",
+        "text": "#e2e8f0",
+        "muted": "#94a3b8",
+        "border": "#334155",
+        "highlight": "#38bdf8",
+        "highlight_text": "#0f172a",
+        "button": "#334155",
+        "button_hover": "#475569",
+        "input": "#0f172a",
+        "tab_selected": "#1e293b",
+        "agent_user": "#38bdf8",
+        "agent_thought": "#94a3b8",
+        "agent_action": "#34d399",
+        "agent_system": "#c084fc",
+        "agent_error": "#fb7185",
+        "agent_default": "#e2e8f0",
+    },
+}
+THEME_ORDER = ["light", "dark", "midnight"]
+
+BACKGROUND_PRESETS = {
+    "default": {"label": "Theme default", "color": None},
+    "slate": {"label": "Slate", "color": "#475569"},
+    "ocean": {"label": "Ocean", "color": "#0e7490"},
+    "forest": {"label": "Forest", "color": "#166534"},
+    "sunset": {"label": "Sunset", "color": "#9a3412"},
+    "lavender": {"label": "Lavender", "color": "#6d28d9"},
+    "rose": {"label": "Rose", "color": "#9f1239"},
+    "custom": {"label": "Custom color…", "color": None},
+}
+BACKGROUND_ORDER = [
+    "default",
+    "slate",
+    "ocean",
+    "forest",
+    "sunset",
+    "lavender",
+    "rose",
+    "custom",
+]
+DEFAULT_CUSTOM_BG = "#2563eb"
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_data")
 BOOKMARKS_FILE = os.path.join(DATA_DIR, "bookmarks.json")
@@ -664,6 +755,147 @@ def _save_json(path, data):
         pass
 
 
+def _normalize_hex(value, fallback=DEFAULT_CUSTOM_BG):
+    if not isinstance(value, str):
+        return fallback
+    text = value.strip()
+    if not text.startswith("#"):
+        text = "#" + text
+    body = text[1:]
+    if len(body) == 3 and all(ch in "0123456789abcdefABCDEF" for ch in body):
+        body = "".join(ch * 2 for ch in body)
+    if len(body) != 6:
+        return fallback
+    try:
+        int(body, 16)
+    except ValueError:
+        return fallback
+    return "#" + body.lower()
+
+
+def _hex_luminance(hex_color):
+    body = _normalize_hex(hex_color)[1:]
+    red = int(body[0:2], 16)
+    green = int(body[2:4], 16)
+    blue = int(body[4:6], 16)
+    return (0.299 * red + 0.587 * green + 0.114 * blue) / 255.0
+
+
+def appearance_colors(settings):
+    theme_id = settings.get("theme", "light")
+    if theme_id not in THEME_PRESETS:
+        theme_id = "light"
+    colors = dict(THEME_PRESETS[theme_id])
+    bg_id = settings.get("background", "default")
+    if bg_id not in BACKGROUND_PRESETS:
+        bg_id = "default"
+    override = BACKGROUND_PRESETS[bg_id]["color"]
+    if bg_id == "custom":
+        override = _normalize_hex(settings.get("background_color", ""))
+    if override:
+        colors["window"] = override
+        if _hex_luminance(override) < 0.55:
+            colors["chrome_text"] = "#f8fafc"
+            colors["chrome_muted"] = "#cbd5e1"
+        else:
+            colors["chrome_text"] = "#0f172a"
+            colors["chrome_muted"] = "#334155"
+    else:
+        colors["chrome_text"] = colors["text"]
+        colors["chrome_muted"] = colors["muted"]
+    return colors
+
+
+def _build_palette(colors):
+    pal = QPalette()
+    window = QColor(colors["window"])
+    surface = QColor(colors["surface"])
+    text = QColor(colors["text"])
+    muted = QColor(colors["muted"])
+    highlight = QColor(colors["highlight"])
+    highlight_text = QColor(colors["highlight_text"])
+    pal.setColor(QPalette.ColorRole.Window, window)
+    pal.setColor(QPalette.ColorRole.WindowText, QColor(colors["chrome_text"]))
+    pal.setColor(QPalette.ColorRole.Base, QColor(colors["input"]))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(colors["alt"]))
+    pal.setColor(QPalette.ColorRole.Text, text)
+    pal.setColor(QPalette.ColorRole.Button, QColor(colors["button"]))
+    pal.setColor(QPalette.ColorRole.ButtonText, text)
+    pal.setColor(QPalette.ColorRole.BrightText, highlight_text)
+    pal.setColor(QPalette.ColorRole.Highlight, highlight)
+    pal.setColor(QPalette.ColorRole.HighlightedText, highlight_text)
+    pal.setColor(QPalette.ColorRole.ToolTipBase, surface)
+    pal.setColor(QPalette.ColorRole.ToolTipText, text)
+    pal.setColor(QPalette.ColorRole.PlaceholderText, muted)
+    pal.setColor(QPalette.ColorRole.Link, highlight)
+    return pal
+
+
+def _chrome_stylesheet(colors):
+    return "\n".join((
+        "QMainWindow { background: %(window)s; color: %(chrome_text)s; }",
+        "QDialog { background: %(surface)s; color: %(text)s; }",
+        "QMenuBar { background: %(window)s; color: %(chrome_text)s; }",
+        "QMenuBar::item { background: transparent; color: %(chrome_text)s;",
+        "  padding: 4px 8px; }",
+        "QMenuBar::item:selected { background: %(highlight)s;",
+        "  color: %(highlight_text)s; }",
+        "QMenu { background: %(surface)s; color: %(text)s;",
+        "  border: 1px solid %(border)s; }",
+        "QMenu::item { padding: 4px 18px; }",
+        "QMenu::item:selected { background: %(highlight)s;",
+        "  color: %(highlight_text)s; }",
+        "QMenu::separator { height: 1px; background: %(border)s;",
+        "  margin: 4px 8px; }",
+        "QToolBar { background: %(window)s; border: none; spacing: 4px;",
+        "  padding: 4px; color: %(chrome_text)s; }",
+        "QStatusBar { background: %(window)s; color: %(chrome_muted)s; }",
+        "QDockWidget { color: %(chrome_text)s; }",
+        "QDockWidget::title { background: %(window)s; color: %(chrome_text)s;",
+        "  padding: 4px; }",
+        "QLineEdit, QTextEdit, QListWidget, QComboBox {",
+        "  background: %(input)s; color: %(text)s;",
+        "  border: 1px solid %(border)s; border-radius: 4px;",
+        "  padding: 3px 6px;",
+        "  selection-background-color: %(highlight)s;",
+        "  selection-color: %(highlight_text)s; }",
+        "QComboBox QAbstractItemView { background: %(surface)s; color: %(text)s;",
+        "  selection-background-color: %(highlight)s;",
+        "  selection-color: %(highlight_text)s; }",
+        "QPushButton { background: %(button)s; color: %(text)s;",
+        "  border: 1px solid %(border)s; border-radius: 4px;",
+        "  padding: 4px 12px; }",
+        "QPushButton:hover { background: %(button_hover)s; }",
+        "QPushButton:pressed { background: %(alt)s; }",
+        "QPushButton:disabled { color: %(muted)s; }",
+        "QTabWidget::pane { border: 1px solid %(border)s;",
+        "  background: %(surface)s; }",
+        "QTabBar::tab { background: %(alt)s; color: %(text)s;",
+        "  border: 1px solid %(border)s; padding: 6px 12px;",
+        "  margin-right: 2px; }",
+        "QTabBar::tab:selected { background: %(tab_selected)s; }",
+        "QTabBar::tab:hover { background: %(button_hover)s; }",
+        "QProgressBar { border: 1px solid %(border)s; background: %(alt)s;",
+        "  border-radius: 3px; }",
+        "QProgressBar::chunk { background: %(highlight)s; }",
+        "QScrollBar:vertical { background: %(alt)s; width: 12px; }",
+        "QScrollBar::handle:vertical { background: %(border)s;",
+        "  min-height: 20px; border-radius: 4px; }",
+        "QScrollBar:horizontal { background: %(alt)s; height: 12px; }",
+        "QScrollBar::handle:horizontal { background: %(border)s;",
+        "  min-width: 20px; border-radius: 4px; }",
+        "QGroupBox { color: %(text)s; border: 1px solid %(border)s;",
+        "  border-radius: 6px; margin-top: 8px;",
+        "  padding: 10px 8px 6px 8px; }",
+        "QGroupBox::title { subcontrol-origin: margin; left: 10px;",
+        "  padding: 0 4px; color: %(text)s; }",
+        "QLabel#mutedHint { color: %(muted)s; }",
+        "QToolTip { background: %(surface)s; color: %(text)s;",
+        "  border: 1px solid %(border)s; }",
+        "QMessageBox, QColorDialog { background: %(surface)s; color: %(text)s; }",
+    )) % colors
+
+
 # ---------------------------------------------------------- tab site groups
 # Open tabs are classified by hostname (and a few Google paths) into a small
 # set of website types. Matching prefers exact domain suffixes, then a brand
@@ -962,19 +1194,44 @@ class TabGroupStrip(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._buttons = []
+        self._colors = dict(THEME_PRESETS["light"])
+        self._colors["chrome_muted"] = self._colors["muted"]
         self.setObjectName("TabGroupStrip")
-        self.setStyleSheet(
-            "#TabGroupStrip { background: #f4f5f7; border-bottom: 1px solid #e4e7ec; }"
-        )
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
         layout.setSpacing(6)
-        hint = QLabel("Groups")
-        hint.setStyleSheet("color: #667085; font-size: 11px; background: transparent;")
-        layout.addWidget(hint)
+        self._hint = QLabel("Groups")
+        layout.addWidget(self._hint)
         layout.addStretch(1)
         self._layout = layout
+        self.apply_appearance(self._colors)
         self.hide()
+
+    def apply_appearance(self, colors):
+        self._colors = colors
+        self.setStyleSheet(
+            f"#TabGroupStrip {{ background: {colors['window']}; "
+            f"border-bottom: 1px solid {colors['border']}; }}"
+        )
+        self._hint.setStyleSheet(
+            f"color: {colors['chrome_muted']}; font-size: 11px; "
+            "background: transparent;"
+        )
+        for btn in self._buttons:
+            self._style_chip(btn)
+
+    def _style_chip(self, btn):
+        colors = self._colors
+        color = btn.property("accent") or category_color("other")
+        btn.setStyleSheet(
+            f"QPushButton {{ background: {colors['surface']}; "
+            f"color: {colors['text']}; border: 1px solid {colors['border']};"
+            f" border-left: 4px solid {color}; border-radius: 4px;"
+            " padding: 3px 10px; font-size: 11px; }"
+            f"QPushButton:checked {{ background: {colors['alt']}; "
+            "font-weight: 600; }"
+            f"QPushButton:hover {{ background: {colors['button_hover']}; }}"
+        )
 
     def update_groups(self, groups, current_cat):
         for btn in self._buttons:
@@ -992,16 +1249,11 @@ class TabGroupStrip(QWidget):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             btn.setProperty("category", cat)
+            btn.setProperty("accent", color)
             btn.setToolTip(
                 f"Jump to {label} tabs. Right-click to close this group."
             )
-            btn.setStyleSheet(
-                "QPushButton { background: #ffffff; border: 1px solid #d0d5dd;"
-                f" border-left: 4px solid {color}; border-radius: 4px;"
-                " padding: 3px 10px; font-size: 11px; }"
-                f"QPushButton:checked {{ background: {color}22; font-weight: 600; }}"
-                f"QPushButton:hover {{ background: {color}18; }}"
-            )
+            self._style_chip(btn)
             btn.clicked.connect(lambda _checked=False, c=cat: self.group_selected.emit(c))
             btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             btn.customContextMenuRequested.connect(
@@ -1539,32 +1791,158 @@ class WebBoxDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    """Application preferences (search engine)."""
+    """Application preferences (search, appearance, privacy)."""
 
-    def __init__(self, parent, current_engine="google"):
+    def __init__(self, parent, settings):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        layout = QFormLayout(self)
-        self.engine_combo = QComboBox()
-        for key in SEARCH_ENGINE_ORDER:
-            self.engine_combo.addItem(SEARCH_ENGINES[key]["label"], key)
-        idx = self.engine_combo.findData(current_engine)
-        if idx >= 0:
-            self.engine_combo.setCurrentIndex(idx)
-        layout.addRow("Search engine:", self.engine_combo)
-        hint = QLabel("Used for Home, new tabs, and the address-bar search box.")
-        hint.setStyleSheet("color: #667085;")
-        hint.setWordWrap(True)
-        layout.addRow(hint)
+        self.setMinimumWidth(440)
+        self._custom_color = _normalize_hex(
+            settings.get("background_color", DEFAULT_CUSTOM_BG)
+        )
+        root = QVBoxLayout(self)
+        root.addWidget(self._search_group(settings))
+        root.addWidget(self._appearance_group(settings))
+        root.addWidget(self._privacy_group())
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        root.addWidget(buttons)
+        self._refresh_history_status()
+        self._sync_color_button()
+
+    def _muted_label(self, text):
+        hint = QLabel(text)
+        hint.setObjectName("mutedHint")
+        hint.setWordWrap(True)
+        return hint
+
+    def _search_group(self, settings):
+        box = QGroupBox("Search")
+        form = QFormLayout(box)
+        self.engine_combo = QComboBox()
+        for key in SEARCH_ENGINE_ORDER:
+            self.engine_combo.addItem(SEARCH_ENGINES[key]["label"], key)
+        idx = self.engine_combo.findData(settings.get("search_engine", "google"))
+        if idx >= 0:
+            self.engine_combo.setCurrentIndex(idx)
+        form.addRow("Search engine:", self.engine_combo)
+        form.addRow(self._muted_label(
+            "Used for Home, new tabs, and the address-bar search box."
+        ))
+        return box
+
+    def _appearance_group(self, settings):
+        box = QGroupBox("Appearance")
+        form = QFormLayout(box)
+        self.theme_combo = QComboBox()
+        for key in THEME_ORDER:
+            self.theme_combo.addItem(THEME_PRESETS[key]["label"], key)
+        idx = self.theme_combo.findData(settings.get("theme", "light"))
+        if idx >= 0:
+            self.theme_combo.setCurrentIndex(idx)
+        form.addRow("Theme:", self.theme_combo)
+
+        bg_row = QWidget()
+        bg_layout = QHBoxLayout(bg_row)
+        bg_layout.setContentsMargins(0, 0, 0, 0)
+        self.background_combo = QComboBox()
+        for key in BACKGROUND_ORDER:
+            self.background_combo.addItem(BACKGROUND_PRESETS[key]["label"], key)
+        idx = self.background_combo.findData(settings.get("background", "default"))
+        if idx >= 0:
+            self.background_combo.setCurrentIndex(idx)
+        self.color_btn = QPushButton()
+        self.color_btn.setToolTip("Choose a custom background color")
+        self.color_btn.setFixedSize(36, 24)
+        self.color_btn.clicked.connect(self._pick_background_color)
+        bg_layout.addWidget(self.background_combo, 1)
+        bg_layout.addWidget(self.color_btn)
+        form.addRow("Background:", bg_row)
+        form.addRow(self._muted_label(
+            "Theme colors the interface. Background tints the toolbar, "
+            "menus, and sidebars."
+        ))
+        self.theme_combo.currentIndexChanged.connect(self._sync_color_button)
+        self.background_combo.currentIndexChanged.connect(self._sync_color_button)
+        return box
+
+    def _privacy_group(self):
+        box = QGroupBox("Privacy")
+        layout = QVBoxLayout(box)
+        self.history_status = QLabel()
+        self.history_status.setObjectName("mutedHint")
+        self.history_status.setWordWrap(True)
+        self.clear_history_btn = QPushButton("Clear browsing history")
+        self.clear_history_btn.clicked.connect(self._clear_history)
+        layout.addWidget(self.history_status)
+        layout.addWidget(self.clear_history_btn)
+        return box
 
     def search_engine(self):
         return self.engine_combo.currentData() or "google"
+
+    def theme(self):
+        return self.theme_combo.currentData() or "light"
+
+    def background(self):
+        return self.background_combo.currentData() or "default"
+
+    def background_color(self):
+        return self._custom_color
+
+    def _preview_settings(self):
+        return {
+            "theme": self.theme(),
+            "background": self.background(),
+            "background_color": self._custom_color,
+        }
+
+    def _sync_color_button(self):
+        colors = appearance_colors(self._preview_settings())
+        self.color_btn.setStyleSheet(
+            f"QPushButton {{ background: {colors['window']}; "
+            f"border: 1px solid {colors['border']}; }}"
+        )
+
+    def _pick_background_color(self):
+        current = QColor(appearance_colors(self._preview_settings())["window"])
+        chosen = QColorDialog.getColor(current, self, "Background color")
+        if not chosen.isValid():
+            return
+        self._custom_color = _normalize_hex(chosen.name())
+        idx = self.background_combo.findData("custom")
+        if idx >= 0:
+            self.background_combo.setCurrentIndex(idx)
+        self._sync_color_button()
+
+    def _refresh_history_status(self):
+        parent = self.parent()
+        insecret = bool(getattr(parent, "insecret", False))
+        count = len(getattr(parent, "history", []) or [])
+        if insecret:
+            self.history_status.setText(
+                "Insecret windows do not keep browsing history."
+            )
+            self.clear_history_btn.setEnabled(False)
+            return
+        if count:
+            noun = "visit" if count == 1 else "visits"
+            self.history_status.setText(
+                f"{count} saved {noun} on this device. Clearing cannot be undone."
+            )
+        else:
+            self.history_status.setText("No saved visits on this device.")
+        self.clear_history_btn.setEnabled(count > 0)
+
+    def _clear_history(self):
+        parent = self.parent()
+        if parent is None or not hasattr(parent, "clear_history_with_prompt"):
+            return
+        if parent.clear_history_with_prompt():
+            self._refresh_history_status()
 
 
 class BrowserWindow(QMainWindow):
@@ -1586,6 +1964,7 @@ class BrowserWindow(QMainWindow):
         self.settings = _load_json(SETTINGS_FILE, {})
         self._migrate_settings()
         self._migrate_webboxes()
+        self._appearance = appearance_colors(self.settings)
 
         self.tabs = QTabWidget()
         self.tabs.setTabBar(GroupedTabBar(self.tabs))
@@ -1629,6 +2008,7 @@ class BrowserWindow(QMainWindow):
         self._dino_filter_timer.timeout.connect(self._refresh_dino_filter)
         self._dino_filter_timer.start(300)
         self.add_tab(QUrl(self.home_url()))
+        self.apply_appearance()
 
     def _start_blink_host(self):
         try:
@@ -2368,7 +2748,7 @@ class BrowserWindow(QMainWindow):
     def _rebuild_history_menu(self):
         self.history_menu.clear()
         clear = self.history_menu.addAction("Clear history")
-        clear.triggered.connect(self._clear_history)
+        clear.triggered.connect(self.clear_history_with_prompt)
         self.history_menu.addSeparator()
         if not self.history:
             empty = self.history_menu.addAction("(empty)")
@@ -2382,10 +2762,40 @@ class BrowserWindow(QMainWindow):
                 lambda _checked, u=item["url"]: self.current_view().setUrl(QUrl(u))
             )
 
+    def clear_history_with_prompt(self):
+        if self.insecret:
+            QMessageBox.information(
+                self,
+                "History",
+                "Insecret windows do not keep browsing history.",
+            )
+            return False
+        if not self.history:
+            QMessageBox.information(
+                self,
+                "Clear browsing history",
+                "There is no saved browsing history to clear.",
+            )
+            return False
+        confirm = QMessageBox.question(
+            self,
+            "Clear browsing history",
+            "Remove all saved visits from this device? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return False
+        self._clear_history()
+        return True
+
     def _clear_history(self):
-        self.history = []
-        _save_json(HISTORY_FILE, self.history)
-        self.refresh_library()
+        for window in BrowserWindow._windows:
+            if window.insecret:
+                continue
+            window.history = []
+            window.refresh_library()
+        _save_json(HISTORY_FILE, [])
         self.statusBar().showMessage("History cleared", 2000)
 
     # -------------------------------------------------------------- library
@@ -2461,7 +2871,29 @@ class BrowserWindow(QMainWindow):
         self.settings.setdefault("azure_endpoint", "")
         self.settings.setdefault("azure_deployment", "")
         self.settings.setdefault("azure_api_version", DEFAULT_AZURE_API_VERSION)
+        self.settings.setdefault("theme", "light")
+        self.settings.setdefault("background", "default")
+        self.settings.setdefault("background_color", DEFAULT_CUSTOM_BG)
+        if self.settings.get("theme") not in THEME_PRESETS:
+            self.settings["theme"] = "light"
+        if self.settings.get("background") not in BACKGROUND_PRESETS:
+            self.settings["background"] = "default"
+        self.settings["background_color"] = _normalize_hex(
+            self.settings.get("background_color", DEFAULT_CUSTOM_BG)
+        )
         _save_json(SETTINGS_FILE, self.settings)
+
+    def apply_appearance(self):
+        colors = appearance_colors(self.settings)
+        self._appearance = colors
+        app = QApplication.instance()
+        if app is not None:
+            if app.style().objectName().lower() != "fusion":
+                app.setStyle("Fusion")
+            app.setPalette(_build_palette(colors))
+            app.setStyleSheet(_chrome_stylesheet(colors))
+        if hasattr(self, "group_strip"):
+            self.group_strip.apply_appearance(colors)
 
     def _new_window(self):
         window = BrowserWindow(insecret=False)
@@ -2472,14 +2904,30 @@ class BrowserWindow(QMainWindow):
         window.show()
 
     def _open_settings(self):
-        dialog = SettingsDialog(self, self.settings.get("search_engine", "google"))
+        dialog = SettingsDialog(self, self.settings)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.settings["search_engine"] = dialog.search_engine()
+        self.settings["theme"] = dialog.theme()
+        self.settings["background"] = dialog.background()
+        self.settings["background_color"] = dialog.background_color()
         _save_json(SETTINGS_FILE, self.settings)
+        updates = {
+            "search_engine": self.settings["search_engine"],
+            "theme": self.settings["theme"],
+            "background": self.settings["background"],
+            "background_color": self.settings["background_color"],
+        }
+        for window in BrowserWindow._windows:
+            window.settings.update(updates)
+            window.apply_appearance()
+        engine = SEARCH_ENGINES[self.settings["search_engine"]]["label"]
+        theme = THEME_PRESETS[self.settings["theme"]]["label"]
+        bg_id = self.settings["background"]
+        background = BACKGROUND_PRESETS[bg_id]["label"]
         self.statusBar().showMessage(
-            "Search engine: " + SEARCH_ENGINES[self.settings["search_engine"]]["label"],
-            2500,
+            f"Search: {engine} · Theme: {theme} · Background: {background}",
+            3500,
         )
 
     def _assign_tab_group(self, cat):
@@ -2736,14 +3184,15 @@ class BrowserWindow(QMainWindow):
         self.agent.start(instruction)
 
     def _append_agent_log(self, role, message):
-        colors = {
-            "user": "#2563eb",
-            "thought": "#6b7280",
-            "action": "#059669",
-            "system": "#9333ea",
-            "error": "#dc2626",
+        colors = getattr(self, "_appearance", THEME_PRESETS["light"])
+        mapping = {
+            "user": colors.get("agent_user", "#2563eb"),
+            "thought": colors.get("agent_thought", "#6b7280"),
+            "action": colors.get("agent_action", "#059669"),
+            "system": colors.get("agent_system", "#9333ea"),
+            "error": colors.get("agent_error", "#dc2626"),
         }
-        color = colors.get(role, "#111827")
+        color = mapping.get(role, colors.get("agent_default", "#111827"))
         self.agent_log.append(
             f'<span style="color:{color};"><b>{role}:</b> {message}</span>'
         )
@@ -2756,6 +3205,7 @@ class BrowserWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     window = BrowserWindow()
     window.show()
     sys.exit(app.exec())
