@@ -6,9 +6,9 @@ import tempfile
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from pyblink.cdp import CdpClient
-from pyblink.chromium import launch_chromium, unused_port, wait_for_devtools
-from pyblink.extensions import extension_paths
+from blinkengine.cdp import CdpClient
+from blinkengine.chromium import launch_chromium, unused_port, wait_for_devtools
+from blinkengine.extensions import extension_paths
 
 
 class BlinkDownload:
