@@ -1384,6 +1384,7 @@ class TabDockHandle(QWidget):
             self._press_global = event.globalPosition()
             self._dragging = False
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.grabMouse()
             event.accept()
             return
         super().mousePressEvent(event)
@@ -1404,6 +1405,8 @@ class TabDockHandle(QWidget):
 
     def mouseReleaseEvent(self, event):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+        if QWidget.mouseGrabber() is self:
+            self.releaseMouse()
         if event.button() == Qt.MouseButton.LeftButton and self._dragging:
             self.dock_drag_finished.emit(event.globalPosition().toPoint())
             event.accept()
@@ -1422,7 +1425,7 @@ class DockDropOverlay(QWidget):
     """
 
     def __init__(self, parent=None):
-        super().__init__(parent, Qt.WindowType.Tool)
+        super().__init__(None)
         self._zone = None
         self.setWindowFlags(
             Qt.WindowType.Tool
@@ -1433,7 +1436,6 @@ class DockDropOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setWindowOpacity(0.88)
         self.hide()
 
     def set_zone(self, zone):
@@ -1445,19 +1447,19 @@ class DockDropOverlay(QWidget):
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(15, 23, 42, 40))
+        painter.fillRect(self.rect(), QColor(15, 23, 42, 80))
         font = QFont(self.font())
-        font.setPointSize(11)
+        font.setPointSize(14)
         font.setBold(True)
         painter.setFont(font)
         for name, rect in _dock_zone_rects(self.size()).items():
             active = name == self._zone
-            fill = QColor(37, 99, 235, 150) if active else QColor(255, 255, 255, 70)
-            border = QColor(37, 99, 235, 230) if active else QColor(255, 255, 255, 140)
-            painter.setPen(QPen(border, 2))
+            fill = QColor(37, 99, 235) if active else QColor(226, 232, 240)
+            border = QColor(30, 64, 175) if active else QColor(148, 163, 184)
+            painter.setPen(QPen(border, 3))
             painter.setBrush(fill)
-            painter.drawRoundedRect(rect.adjusted(6, 6, -6, -6), 8, 8)
-            painter.setPen(QColor("#ffffff") if active else QColor("#1f2937"))
+            painter.drawRoundedRect(rect.adjusted(8, 8, -8, -8), 10, 10)
+            painter.setPen(QColor("#ffffff") if active else QColor("#0f172a"))
             painter.drawText(
                 rect,
                 Qt.AlignmentFlag.AlignCenter,
@@ -3703,6 +3705,9 @@ class BrowserWindow(QMainWindow):
         self.tabs.setCurrentIndex(current)
 
     def closeEvent(self, event):
+        if getattr(self, "_dock_overlay", None) is not None:
+            self._dock_overlay.hide()
+            self._dock_overlay.close()
         for i in range(self.tabs.count()):
             view = self.tabs.widget(i)
             if view is not None:
