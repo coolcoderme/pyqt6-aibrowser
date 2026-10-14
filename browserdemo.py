@@ -4,6 +4,10 @@ Features: tabs, automatic and manual tab groups by site type, navigation,
 smart address bar, WebBoxes, browsing history, a library sidebar, download
 handling, Chrome Web Store extensions, Insecret windows, and an optional
 LLM-powered browsing agent.
+
+The window is custom-decorated (Chrome-style): the tab strip lives in the
+title-bar area with system caption buttons, and the tab strip can be docked
+to any edge of the window.
 """
 
 import json
@@ -15,8 +19,19 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QKeySequence, QPainter
+from PyQt6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QRect,
+    QSettings,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    pyqtSignal,
+)
+from PyQt6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QKeySequence, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -33,9 +48,12 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMenu,
+    QMenuBar,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
+    QStackedWidget,
     QTabBar,
     QTabWidget,
     QTextEdit,
@@ -111,6 +129,18 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 PROFILE_DIR = os.path.join(DATA_DIR, "profile")
 BLINK_PROFILE_DIR = os.path.join(DATA_DIR, "blink_profile")
+
+APP_ORG_NAME = "PyQt6Browser"
+APP_NAME = "browserdemo"
+TAB_STRIP_POSITIONS = ("top", "left", "right", "bottom")
+TAB_STRIP_LABELS = {
+    "top": "Top",
+    "left": "Left",
+    "right": "Right",
+    "bottom": "Bottom",
+}
+RESIZE_MARGIN = 6
+DOCK_ZONE_MIN = 56
 
 MAX_HISTORY = 1000
 AGENT_MAX_STEPS = 10
@@ -926,7 +956,7 @@ class _GroupDot(QWidget):
 
 
 class GroupedTabBar(QTabBar):
-    """Tab bar that paints a category-colored bar under consecutive groups."""
+    """Tab bar that paints a category-colored bar along consecutive groups."""
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -935,21 +965,43 @@ class GroupedTabBar(QTabBar):
             return
         painter = QPainter(self)
         painter.setPen(Qt.PenStyle.NoPen)
+        shape = self.shape()
+        vertical = shape in (
+            QTabBar.Shape.RoundedWest,
+            QTabBar.Shape.RoundedEast,
+            QTabBar.Shape.TriangularWest,
+            QTabBar.Shape.TriangularEast,
+        )
+        east = shape in (QTabBar.Shape.RoundedEast, QTabBar.Shape.TriangularEast)
+        south = shape in (QTabBar.Shape.RoundedSouth, QTabBar.Shape.TriangularSouth)
         index = 0
         while index < count:
             cat = self.tabData(index) or "other"
             end = index + 1
             while end < count and (self.tabData(end) or "other") == cat:
                 end += 1
-            left = self.tabRect(index)
-            right = self.tabRect(end - 1)
+            first = self.tabRect(index)
+            last = self.tabRect(end - 1)
             painter.setBrush(QColor(category_color(cat)))
-            painter.drawRect(
-                left.x() + 2,
-                left.bottom() - 3,
-                max(0, right.right() - left.x() - 3),
-                3,
-            )
+            if vertical:
+                top = min(first.top(), last.top())
+                bottom = max(first.bottom(), last.bottom())
+                x = first.x() if east else first.right() - 3
+                painter.drawRect(x, top + 2, 3, max(0, bottom - top - 3))
+            elif south:
+                painter.drawRect(
+                    first.x() + 2,
+                    first.y(),
+                    max(0, last.right() - first.x() - 3),
+                    3,
+                )
+            else:
+                painter.drawRect(
+                    first.x() + 2,
+                    first.bottom() - 3,
+                    max(0, last.right() - first.x() - 3),
+                    3,
+                )
             index = end
 
 
@@ -1023,6 +1075,594 @@ class TabGroupStrip(QWidget):
             self.group_selected.emit(cat)
         elif chosen is close:
             self.close_group_requested.emit(cat)
+
+
+def _ui_settings():
+    return QSettings(APP_ORG_NAME, APP_NAME)
+
+
+def _controls_on_left():
+    return sys.platform == "darwin"
+
+
+def _normalize_tab_position(value, default="top"):
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "ignore")
+    if not isinstance(value, str):
+        return default
+    key = value.strip().lower()
+    return key if key in TAB_STRIP_POSITIONS else default
+
+
+def _load_tab_strip_position(app_settings=None):
+    if isinstance(app_settings, dict):
+        stored = app_settings.get("tab_strip_position")
+        if stored:
+            return _normalize_tab_position(stored)
+    return _normalize_tab_position(_ui_settings().value("tab_strip_position", "top"))
+
+
+def _save_tab_strip_position(position, app_settings=None):
+    position = _normalize_tab_position(position)
+    _ui_settings().setValue("tab_strip_position", position)
+    if isinstance(app_settings, dict):
+        app_settings["tab_strip_position"] = position
+    return position
+
+
+def _resize_edges_at(pos, size, margin=RESIZE_MARGIN):
+    """Return Qt.Edge flags for a point in a widget of the given size, or 0."""
+    if size.width() < margin * 2 or size.height() < margin * 2:
+        return Qt.Edge(0)
+    edges = Qt.Edge(0)
+    if pos.x() <= margin:
+        edges |= Qt.Edge.LeftEdge
+    elif pos.x() >= size.width() - margin:
+        edges |= Qt.Edge.RightEdge
+    if pos.y() <= margin:
+        edges |= Qt.Edge.TopEdge
+    elif pos.y() >= size.height() - margin:
+        edges |= Qt.Edge.BottomEdge
+    return edges
+
+
+def _cursor_for_edges(edges):
+    left = bool(edges & Qt.Edge.LeftEdge)
+    right = bool(edges & Qt.Edge.RightEdge)
+    top = bool(edges & Qt.Edge.TopEdge)
+    bottom = bool(edges & Qt.Edge.BottomEdge)
+    if (left and top) or (right and bottom):
+        return Qt.CursorShape.SizeFDiagCursor
+    if (right and top) or (left and bottom):
+        return Qt.CursorShape.SizeBDiagCursor
+    if left or right:
+        return Qt.CursorShape.SizeHorCursor
+    if top or bottom:
+        return Qt.CursorShape.SizeVerCursor
+    return Qt.CursorShape.ArrowCursor
+
+
+def _dock_zone_rects(size, thickness=None):
+    width, height = size.width(), size.height()
+    if thickness is None:
+        thickness = max(DOCK_ZONE_MIN, int(min(width, height) * 0.2))
+    thickness = min(thickness, max(1, width // 2), max(1, height // 2))
+    return {
+        "top": QRect(0, 0, width, thickness),
+        "bottom": QRect(0, height - thickness, width, thickness),
+        "left": QRect(0, 0, thickness, height),
+        "right": QRect(width - thickness, 0, thickness, height),
+    }
+
+
+def _dock_zone_at(pos, size):
+    """Pick the nearest window-edge dock zone, or None if outside all zones."""
+    rects = _dock_zone_rects(size)
+    hits = [name for name, rect in rects.items() if rect.contains(pos)]
+    if not hits:
+        return None
+    dists = {
+        "top": pos.y(),
+        "bottom": size.height() - pos.y(),
+        "left": pos.x(),
+        "right": size.width() - pos.x(),
+    }
+    return min(hits, key=dists.get)
+
+
+def _tab_bar_stylesheet(position):
+    """Chrome-like tab chrome; radius follows the docked edge."""
+    if position in ("left", "right"):
+        radius = (
+            "border-top-right-radius: 8px; border-bottom-right-radius: 8px;"
+            if position == "left"
+            else "border-top-left-radius: 8px; border-bottom-left-radius: 8px;"
+        )
+        padding = "padding: 10px 12px; min-height: 28px; max-width: 200px;"
+        margin = "margin: 2px 0;"
+    elif position == "bottom":
+        radius = "border-bottom-left-radius: 8px; border-bottom-right-radius: 8px;"
+        padding = "padding: 7px 16px; min-width: 60px; max-width: 240px;"
+        margin = "margin: 0 2px 4px 2px;"
+    else:
+        radius = "border-top-left-radius: 8px; border-top-right-radius: 8px;"
+        padding = "padding: 7px 16px; min-width: 60px; max-width: 240px;"
+        margin = "margin: 4px 2px 0 2px;"
+    return f"""
+        QTabBar {{
+            background: #dee1e6;
+            border: none;
+        }}
+        QTabBar::tab {{
+            background: #cfd3d8;
+            color: #3c4043;
+            border: none;
+            {radius}
+            {padding}
+            {margin}
+        }}
+        QTabBar::tab:selected {{
+            background: #ffffff;
+            color: #202124;
+        }}
+        QTabBar::tab:hover:!selected {{
+            background: #e8eaed;
+        }}
+        QTabBar::close-button {{
+            subcontrol-position: right;
+        }}
+    """
+
+
+class _CaptionButton(QPushButton):
+    """Minimize / maximize-restore / close control for a custom title bar."""
+
+    # pylint: disable=invalid-name
+
+    def __init__(self, kind, parent=None):
+        super().__init__(parent)
+        self._kind = kind
+        self._restored = False
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFlat(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        if _controls_on_left():
+            self.setFixedSize(14, 14)
+            self.setToolTip({"min": "Minimize", "max": "Zoom", "close": "Close"}[kind])
+        else:
+            self.setFixedSize(46, 32)
+            self.setToolTip(
+                {"min": "Minimize", "max": "Maximize", "close": "Close"}[kind]
+            )
+        self._apply_style()
+
+    def set_maximized(self, maximized):
+        self._restored = bool(maximized)
+        if _controls_on_left():
+            self.setToolTip("Restore" if maximized else "Zoom")
+        else:
+            self.setToolTip("Restore" if maximized else "Maximize")
+        self.update()
+
+    def _apply_style(self):
+        if _controls_on_left():
+            colors = {"close": "#ff5f57", "min": "#febc2e", "max": "#28c840"}
+            self.setStyleSheet(
+                "QPushButton { background: %s; border: 0.5px solid rgba(0,0,0,0.15);"
+                " border-radius: 7px; }"
+                "QPushButton:hover { background: %s; }"
+                % (colors[self._kind], colors[self._kind])
+            )
+            return
+        if self._kind == "close":
+            self.setStyleSheet(
+                "QPushButton { background: transparent; border: none; color: #202124;"
+                " font-size: 16px; }"
+                "QPushButton:hover { background: #e81123; color: white; }"
+                "QPushButton:pressed { background: #c50f1f; color: white; }"
+            )
+            return
+        self.setStyleSheet(
+            "QPushButton { background: transparent; border: none; color: #202124;"
+            " font-size: 14px; }"
+            "QPushButton:hover { background: #d0d3d8; }"
+            "QPushButton:pressed { background: #c0c4c8; }"
+        )
+
+    def paintEvent(self, event):
+        if _controls_on_left():
+            super().paintEvent(event)
+            return
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.palette().buttonText().color(), 1.2))
+        cx, cy = self.width() / 2, self.height() / 2
+        if self._kind == "min":
+            painter.drawLine(int(cx - 6), int(cy), int(cx + 6), int(cy))
+        elif self._kind == "max":
+            if self._restored:
+                painter.drawRect(int(cx - 4), int(cy - 6), 9, 9)
+                painter.drawLine(int(cx - 1), int(cy - 6), int(cx - 1), int(cy - 8))
+                painter.drawLine(int(cx - 1), int(cy - 8), int(cx + 8), int(cy - 8))
+                painter.drawLine(int(cx + 8), int(cy - 8), int(cx + 8), int(cy + 1))
+                painter.drawLine(int(cx + 8), int(cy + 1), int(cx + 5), int(cy + 1))
+            else:
+                painter.drawRect(int(cx - 6), int(cy - 6), 12, 12)
+        else:
+            painter.drawLine(int(cx - 5), int(cy - 5), int(cx + 5), int(cy + 5))
+            painter.drawLine(int(cx + 5), int(cy - 5), int(cx - 5), int(cy + 5))
+
+
+class WindowControlButtons(QWidget):
+    """Platform-ordered window caption buttons."""
+
+    minimize_requested = pyqtSignal()
+    maximize_requested = pyqtSignal()
+    close_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("WindowControlButtons")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8 if _controls_on_left() else 0)
+        self.min_btn = _CaptionButton("min", self)
+        self.max_btn = _CaptionButton("max", self)
+        self.close_btn = _CaptionButton("close", self)
+        self.min_btn.clicked.connect(self.minimize_requested.emit)
+        self.max_btn.clicked.connect(self.maximize_requested.emit)
+        self.close_btn.clicked.connect(self.close_requested.emit)
+        if _controls_on_left():
+            layout.addWidget(self.close_btn)
+            layout.addWidget(self.min_btn)
+            layout.addWidget(self.max_btn)
+            layout.setContentsMargins(8, 0, 8, 0)
+        else:
+            layout.addWidget(self.min_btn)
+            layout.addWidget(self.max_btn)
+            layout.addWidget(self.close_btn)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+
+    def set_maximized(self, maximized):
+        self.max_btn.set_maximized(maximized)
+
+
+class TabDockHandle(QWidget):
+    """Grip used to drag the whole tab strip onto a new window edge."""
+
+    # pylint: disable=invalid-name
+
+    dock_drag_started = pyqtSignal()
+    dock_drag_moved = pyqtSignal(QPoint)
+    dock_drag_finished = pyqtSignal(QPoint)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("TabDockHandle")
+        self.setToolTip("Drag to dock the tab bar at the top, side, or bottom")
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setFixedSize(18, 28)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self._press_global = None
+        self._dragging = False
+
+    def set_vertical(self, vertical):
+        if vertical:
+            self.setFixedSize(28, 18)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        else:
+            self.setFixedSize(18, 28)
+            self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#98a2b3"))
+        vertical = self.width() > self.height()
+        if vertical:
+            y = self.height() // 2
+            for i in range(3):
+                painter.drawEllipse(4 + i * 7, y - 5, 3, 3)
+                painter.drawEllipse(4 + i * 7, y + 2, 3, 3)
+        else:
+            x = self.width() // 2
+            for i in range(3):
+                painter.drawEllipse(x - 5, 6 + i * 7, 3, 3)
+                painter.drawEllipse(x + 2, 6 + i * 7, 3, 3)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_global = event.globalPosition()
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._press_global is None:
+            super().mouseMoveEvent(event)
+            return
+        current = event.globalPosition()
+        if not self._dragging:
+            distance = (current - self._press_global).manhattanLength()
+            if distance < QApplication.startDragDistance():
+                return
+            self._dragging = True
+            self.dock_drag_started.emit()
+        self.dock_drag_moved.emit(current.toPoint())
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        if event.button() == Qt.MouseButton.LeftButton and self._dragging:
+            self.dock_drag_finished.emit(event.globalPosition().toPoint())
+            event.accept()
+        elif event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+        self._press_global = None
+        self._dragging = False
+
+
+class DockDropOverlay(QWidget):
+    """Translucent edge highlights shown while dragging the tab strip."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._zone = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.hide()
+
+    def set_zone(self, zone):
+        if zone == self._zone:
+            return
+        self._zone = zone
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(15, 23, 42, 40))
+        font = QFont(self.font())
+        font.setPointSize(11)
+        font.setBold(True)
+        painter.setFont(font)
+        for name, rect in _dock_zone_rects(self.size()).items():
+            active = name == self._zone
+            fill = QColor(37, 99, 235, 150) if active else QColor(255, 255, 255, 70)
+            border = QColor(37, 99, 235, 230) if active else QColor(255, 255, 255, 140)
+            painter.setPen(QPen(border, 2))
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect.adjusted(6, 6, -6, -6), 8, 8)
+            painter.setPen(QColor("#ffffff") if active else QColor("#1f2937"))
+            painter.drawText(
+                rect,
+                Qt.AlignmentFlag.AlignCenter,
+                "Tabs: " + TAB_STRIP_LABELS[name],
+            )
+
+
+class CaptionDragArea(QWidget):
+    """Empty caption space: drag to move, double-click to maximize/restore."""
+
+    # pylint: disable=invalid-name
+
+    move_requested = pyqtSignal()
+    toggle_max_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CaptionDragArea")
+        self.setMinimumWidth(24)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._label = QLabel(self)
+        self._label.setStyleSheet("color: #344054; font-size: 12px; background: transparent;")
+        self._label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.addWidget(self._label)
+        self._pressing = False
+
+    def set_title(self, title):
+        self._label.setText(title or "")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pressing = True
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pressing and event.buttons() & Qt.MouseButton.LeftButton:
+            self._pressing = False
+            self.move_requested.emit()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._pressing = False
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_max_requested.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class ChromeTabBar(GroupedTabBar):
+    """Grouped tab bar that also acts as a caption when clicking empty space."""
+
+    # pylint: disable=invalid-name
+
+    empty_space_move_requested = pyqtSignal()
+    empty_space_double_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMovable(True)
+        self.setTabsClosable(True)
+        self.setExpanding(False)
+        self.setDocumentMode(True)
+        self.setDrawBase(False)
+        self.setElideMode(Qt.TextElideMode.ElideRight)
+        self.setUsesScrollButtons(True)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._window_drag = False
+
+    def mousePressEvent(self, event):
+        self._window_drag = False
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            if self.tabAt(pos) < 0:
+                self._window_drag = True
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._window_drag:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self._window_drag = False
+                self.empty_space_move_requested.emit()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._window_drag = False
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            if self.tabAt(pos) < 0:
+                self.empty_space_double_clicked.emit()
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+
+class BrowserTabs(QStackedWidget):
+    """QTabWidget-like host whose tab bar can be reparented into the chrome."""
+
+    # pylint: disable=invalid-name
+
+    tabCloseRequested = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.tab_bar = ChromeTabBar()
+        self.tab_bar.tabCloseRequested.connect(self.tabCloseRequested.emit)
+        self.tab_bar.currentChanged.connect(self._sync_stack_from_bar)
+        self.tab_bar.tabMoved.connect(self._on_tab_moved)
+        super().currentChanged.connect(self._sync_bar_from_stack)
+
+    def tabBar(self):
+        return self.tab_bar
+
+    def addTab(self, widget, icon_or_text, text=None):
+        if text is None:
+            icon, label = QIcon(), icon_or_text
+        else:
+            icon, label = icon_or_text, text
+        index = self.addWidget(widget)
+        self.tab_bar.insertTab(index, icon, label)
+        return index
+
+    def removeTab(self, index):
+        widget = self.widget(index)
+        blocked = self.blockSignals(True)
+        self.tab_bar.removeTab(index)
+        if widget is not None:
+            self.removeWidget(widget)
+        self.blockSignals(blocked)
+        current = self.tab_bar.currentIndex()
+        if 0 <= current < self.count() and self.currentIndex() != current:
+            self.setCurrentIndex(current)
+        return widget
+
+    def setTabText(self, index, text):
+        self.tab_bar.setTabText(index, text)
+
+    def tabText(self, index):
+        return self.tab_bar.tabText(index)
+
+    def setTabIcon(self, index, icon):
+        self.tab_bar.setTabIcon(index, icon)
+
+    def tabIcon(self, index):
+        return self.tab_bar.tabIcon(index)
+
+    def setTabToolTip(self, index, tip):
+        self.tab_bar.setTabToolTip(index, tip)
+
+    def tabToolTip(self, index):
+        return self.tab_bar.tabToolTip(index)
+
+    def setCurrentWidget(self, widget):
+        index = self.indexOf(widget)
+        if index >= 0:
+            self.setCurrentIndex(index)
+
+    def _sync_stack_from_bar(self, index):
+        if 0 <= index < self.count() and self.currentIndex() != index:
+            self.setCurrentIndex(index)
+
+    def _sync_bar_from_stack(self, index):
+        if self.tab_bar.currentIndex() != index and 0 <= index < self.tab_bar.count():
+            self.tab_bar.setCurrentIndex(index)
+
+    def _on_tab_moved(self, source, dest):
+        widget = self.widget(source)
+        if widget is None:
+            return
+        blocked = self.blockSignals(True)
+        bar_blocked = self.tab_bar.blockSignals(True)
+        self.removeWidget(widget)
+        self.insertWidget(dest, widget)
+        self.tab_bar.blockSignals(bar_blocked)
+        self.blockSignals(blocked)
+        current = self.tab_bar.currentIndex()
+        if 0 <= current < self.count():
+            self.setCurrentIndex(current)
+
+    def blockSignals(self, block):
+        self.tab_bar.blockSignals(block)
+        return super().blockSignals(block)
+
+
+class _EdgeGrip(QWidget):
+    """Thin strip along a window edge that starts a system (or manual) resize."""
+
+    # pylint: disable=invalid-name
+
+    def __init__(self, edges, parent=None):
+        super().__init__(parent)
+        self._edges = edges
+        self.setCursor(_cursor_for_edges(edges))
+        self.setMouseTracking(True)
+        self.setStyleSheet("background: transparent;")
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        window = self.window()
+        starter = getattr(window, "_begin_edge_resize", None)
+        if callable(starter):
+            starter(self._edges, event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 # --------------------------------------------------------------------- agent
@@ -1568,6 +2208,9 @@ class SettingsDialog(QDialog):
 
 
 class BrowserWindow(QMainWindow):
+    """Main browser window with a custom caption and a dockable tab strip."""
+
+    # pylint: disable=too-many-public-methods,invalid-name
     _windows = []
     _shared_host = None
 
@@ -1575,7 +2218,18 @@ class BrowserWindow(QMainWindow):
         super().__init__()
         self.insecret = insecret
         self.setWindowTitle("PyQt6 Browser" + (" - Insecret" if insecret else ""))
+        self.setMinimumSize(640, 400)
         self.resize(1280, 820)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         BrowserWindow._windows.append(self)
 
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -1586,27 +2240,94 @@ class BrowserWindow(QMainWindow):
         self.settings = _load_json(SETTINGS_FILE, {})
         self._migrate_settings()
         self._migrate_webboxes()
+        self._tab_position = _load_tab_strip_position(self.settings)
+        self._tab_dock_actions = {}
+        self._resize_edges = Qt.Edge(0)
+        self._resize_origin = None
+        self._resize_geom = None
+        self._move_origin = None
+        self._move_offset = None
+        self._manual_interacting = False
 
-        self.tabs = QTabWidget()
-        self.tabs.setTabBar(GroupedTabBar(self.tabs))
-        self.tabs.setTabsClosable(True)
-        self.tabs.setMovable(True)
+        self.tabs = BrowserTabs()
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.tabs.currentChanged.connect(self.on_tab_changed)
-        self.tabs.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tabs.tabBar().customContextMenuRequested.connect(self._tab_bar_menu)
+        self.tabs.tabBar().empty_space_move_requested.connect(self._begin_window_move)
+        self.tabs.tabBar().empty_space_double_clicked.connect(self._toggle_maximized)
 
         self.group_strip = TabGroupStrip()
         self.group_strip.group_selected.connect(self._jump_to_tab_group)
         self.group_strip.close_group_requested.connect(self._close_tab_group)
 
-        central = QWidget()
-        central_layout = QVBoxLayout(central)
-        central_layout.setContentsMargins(0, 0, 0, 0)
-        central_layout.setSpacing(0)
-        central_layout.addWidget(self.group_strip)
-        central_layout.addWidget(self.tabs, 1)
-        self.setCentralWidget(central)
+        self._page_host = QWidget()
+        page_layout = QVBoxLayout(self._page_host)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+        page_layout.addWidget(self.group_strip)
+        page_layout.addWidget(self.tabs, 1)
+
+        self._strip_host = QWidget()
+        self._strip_host.setObjectName("TabStripHost")
+        self._strip_layout = QHBoxLayout(self._strip_host)
+        self._strip_layout.setContentsMargins(4, 0, 4, 0)
+        self._strip_layout.setSpacing(2)
+
+        self._dock_handle = TabDockHandle()
+        self._dock_handle.dock_drag_started.connect(self._on_dock_drag_started)
+        self._dock_handle.dock_drag_moved.connect(self._on_dock_drag_moved)
+        self._dock_handle.dock_drag_finished.connect(self._on_dock_drag_finished)
+        self._dock_handle.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._dock_handle.customContextMenuRequested.connect(self._dock_handle_menu)
+
+        self._controls = WindowControlButtons()
+        self._controls.minimize_requested.connect(self.showMinimized)
+        self._controls.maximize_requested.connect(self._toggle_maximized)
+        self._controls.close_requested.connect(self.close)
+
+        self._caption = CaptionDragArea()
+        self._caption.set_title(self.windowTitle())
+        self._caption.move_requested.connect(self._begin_window_move)
+        self._caption.toggle_max_requested.connect(self._toggle_maximized)
+        self.windowTitleChanged.connect(self._caption.set_title)
+
+        self._menu_bar = QMenuBar()
+        self._menu_bar.setNativeMenuBar(False)
+
+        self._title_row = QWidget()
+        self._title_row.setObjectName("TitleRow")
+        self._title_row_layout = QHBoxLayout(self._title_row)
+        self._title_row_layout.setContentsMargins(0, 0, 0, 0)
+        self._title_row_layout.setSpacing(0)
+        self._title_row.setMinimumHeight(36)
+
+        self._chrome = QWidget()
+        self._chrome.setObjectName("WindowChrome")
+        chrome_layout = QVBoxLayout(self._chrome)
+        chrome_layout.setContentsMargins(0, 0, 0, 0)
+        chrome_layout.setSpacing(0)
+        chrome_layout.addWidget(self._title_row)
+        chrome_layout.addWidget(self._menu_bar)
+        for widget in (self._chrome, self._title_row, self._strip_host, self._caption):
+            widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._chrome.setStyleSheet(
+            "#WindowChrome, #TitleRow, #TabStripHost, #CaptionDragArea {"
+            " background: #dee1e6; }"
+            "#TitleRow { border-bottom: 1px solid #c5c9d0; }"
+        )
+        self.setObjectName("BrowserWindow")
+        self.setStyleSheet("#BrowserWindow { border: 1px solid #9aa0a6; background: #dee1e6; }")
+        self.setMenuWidget(self._chrome)
+
+        self._central = QWidget()
+        self._central.setObjectName("BrowserCentral")
+        self._central_layout = QVBoxLayout(self._central)
+        self._central_layout.setContentsMargins(0, 0, 0, 0)
+        self._central_layout.setSpacing(0)
+        self.setCentralWidget(self._central)
+
+        self._dock_overlay = DockDropOverlay(self)
+        self._edge_grips = self._create_edge_grips()
 
         self._organize_timer = QTimer(self)
         self._organize_timer.setSingleShot(True)
@@ -1620,6 +2341,7 @@ class BrowserWindow(QMainWindow):
         self._build_library_dock()
         self._build_agent_dock()
         self._build_inspector_dock()
+        self._apply_tab_strip_position(self._tab_position, persist=False)
         QApplication.instance().installEventFilter(self)
         # QtWebEngine recreates its native render widget (the view's focusProxy)
         # on load/focus changes; keep re-installing our key filter on it so the
@@ -1701,7 +2423,7 @@ class BrowserWindow(QMainWindow):
         nav.addAction(inspect)
 
     def _build_menus(self):
-        menubar = self.menuBar()
+        menubar = self._menu_bar
 
         file_menu = QMenu("File", self)
         menubar.addMenu(file_menu)
@@ -1755,6 +2477,8 @@ class BrowserWindow(QMainWindow):
         clear_group = self.view_menu.addAction("Clear manual group on this tab")
         clear_group.triggered.connect(self._clear_manual_group)
         self.view_menu.addSeparator()
+        self._add_tab_dock_menu(self.view_menu)
+        self.view_menu.addSeparator()
 
         next_tab = self.view_menu.addAction("Next Tab")
         next_tab.setShortcut(QKeySequence("Ctrl+Tab"))
@@ -1772,6 +2496,19 @@ class BrowserWindow(QMainWindow):
         self.apps_menu = QMenu("Apps", self)
         menubar.addMenu(self.apps_menu)
         self.apps_menu.aboutToShow.connect(self._rebuild_apps_menu)
+
+    def _add_tab_dock_menu(self, parent_menu):
+        dock_menu = parent_menu.addMenu("Dock tab bar")
+        self._tab_dock_actions = {}
+        for key in TAB_STRIP_POSITIONS:
+            action = dock_menu.addAction(TAB_STRIP_LABELS[key])
+            action.setCheckable(True)
+            action.setChecked(key == self._tab_position)
+            action.triggered.connect(
+                lambda _checked=False, pos=key: self._set_tab_strip_position(pos)
+            )
+            self._tab_dock_actions[key] = action
+        return dock_menu
 
     def _build_statusbar(self):
         self.progress = QProgressBar()
@@ -1919,6 +2656,301 @@ class BrowserWindow(QMainWindow):
             self.inspector_log.append(f">>> {script}\n{result!r}")
 
         view.page().runJavaScript(script, done)
+
+    # -------------------------------------------------------- window chrome
+    def _create_edge_grips(self):
+        specs = (
+            Qt.Edge.TopEdge,
+            Qt.Edge.BottomEdge,
+            Qt.Edge.LeftEdge,
+            Qt.Edge.RightEdge,
+            Qt.Edge.TopEdge | Qt.Edge.LeftEdge,
+            Qt.Edge.TopEdge | Qt.Edge.RightEdge,
+            Qt.Edge.BottomEdge | Qt.Edge.LeftEdge,
+            Qt.Edge.BottomEdge | Qt.Edge.RightEdge,
+        )
+        grips = []
+        for edges in specs:
+            grip = _EdgeGrip(edges, self)
+            grip.hide()
+            grips.append(grip)
+        return grips
+
+    def _layout_edge_grips(self):
+        margin = RESIZE_MARGIN
+        width, height = self.width(), self.height()
+        hide = self.isMaximized() or self.isFullScreen()
+        geom = [
+            QRect(margin, 0, max(0, width - 2 * margin), margin),
+            QRect(margin, height - margin, max(0, width - 2 * margin), margin),
+            QRect(0, margin, margin, max(0, height - 2 * margin)),
+            QRect(width - margin, margin, margin, max(0, height - 2 * margin)),
+            QRect(0, 0, margin, margin),
+            QRect(width - margin, 0, margin, margin),
+            QRect(0, height - margin, margin, margin),
+            QRect(width - margin, height - margin, margin, margin),
+        ]
+        for grip, rect in zip(self._edge_grips, geom):
+            grip.setGeometry(rect)
+            grip.setVisible(not hide)
+            if not hide:
+                grip.raise_()
+
+    def _clear_layout(self, layout):
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(self)
+
+    def _replace_box_layout(self, host, vertical):
+        self._clear_layout(host.layout())
+        if host.layout() is not None:
+            QWidget().setLayout(host.layout())
+        layout = QVBoxLayout(host) if vertical else QHBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        return layout
+
+    def _apply_tab_strip_position(self, position, persist=True):
+        position = _normalize_tab_position(position)
+        self._tab_position = position
+        vertical = position in ("left", "right")
+        shapes = {
+            "top": QTabBar.Shape.RoundedNorth,
+            "bottom": QTabBar.Shape.RoundedSouth,
+            "left": QTabBar.Shape.RoundedWest,
+            "right": QTabBar.Shape.RoundedEast,
+        }
+        tab_bar = self.tabs.tabBar()
+        tab_bar.setShape(shapes[position])
+        tab_bar.setStyleSheet(_tab_bar_stylesheet(position))
+        self._dock_handle.set_vertical(vertical)
+
+        self._clear_layout(self._title_row_layout)
+        self._strip_layout = self._replace_box_layout(self._strip_host, vertical)
+        self._central_layout = self._replace_box_layout(self._central, vertical)
+        self._configure_strip_metrics(vertical)
+
+        self._strip_layout.addWidget(self._dock_handle)
+        self._strip_layout.addWidget(tab_bar, 1)
+
+        if _controls_on_left():
+            self._title_row_layout.addWidget(self._controls)
+        if position == "top":
+            self._caption.hide()
+            self._title_row_layout.addWidget(self._strip_host, 1)
+        else:
+            self._caption.show()
+            self._title_row_layout.addWidget(self._caption, 1)
+        if not _controls_on_left():
+            self._title_row_layout.addWidget(self._controls)
+
+        if position == "left":
+            self._central_layout.addWidget(self._strip_host)
+            self._central_layout.addWidget(self._page_host, 1)
+        elif position == "right":
+            self._central_layout.addWidget(self._page_host, 1)
+            self._central_layout.addWidget(self._strip_host)
+        elif position == "bottom":
+            self._central_layout.addWidget(self._page_host, 1)
+            self._central_layout.addWidget(self._strip_host)
+        else:
+            self._central_layout.addWidget(self._page_host, 1)
+
+        self._caption.set_title("" if position == "top" else self.windowTitle())
+        self._sync_tab_dock_actions()
+        if persist:
+            _save_tab_strip_position(position, self.settings)
+            _save_json(SETTINGS_FILE, self.settings)
+        QTimer.singleShot(0, self._layout_edge_grips)
+
+    def _configure_strip_metrics(self, vertical):
+        tab_bar = self.tabs.tabBar()
+        if vertical:
+            self._strip_layout.setContentsMargins(2, 4, 2, 4)
+            tab_bar.setMinimumWidth(132)
+            tab_bar.setMaximumWidth(220)
+            tab_bar.setMinimumHeight(0)
+            tab_bar.setMaximumHeight(16777215)
+            self._strip_host.setMinimumWidth(150)
+            self._strip_host.setMaximumWidth(228)
+            self._strip_host.setMinimumHeight(0)
+            self._strip_host.setMaximumHeight(16777215)
+            self._strip_host.setSizePolicy(
+                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
+            )
+            return
+        self._strip_layout.setContentsMargins(4, 0, 4, 0)
+        tab_bar.setMinimumWidth(0)
+        tab_bar.setMaximumWidth(16777215)
+        tab_bar.setMinimumHeight(0)
+        tab_bar.setMaximumHeight(16777215)
+        self._strip_host.setMinimumWidth(0)
+        self._strip_host.setMaximumWidth(16777215)
+        self._strip_host.setMinimumHeight(0)
+        self._strip_host.setMaximumHeight(16777215)
+        self._strip_host.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+
+    def _set_tab_strip_position(self, position):
+        if _normalize_tab_position(position) == self._tab_position:
+            self._sync_tab_dock_actions()
+            return
+        self._apply_tab_strip_position(position)
+
+    def _sync_tab_dock_actions(self):
+        actions = getattr(self, "_tab_dock_actions", None)
+        if not actions:
+            return
+        for key, action in actions.items():
+            action.setChecked(key == self._tab_position)
+
+    def _on_dock_drag_started(self):
+        self._dock_overlay.setGeometry(self.rect())
+        self._dock_overlay.set_zone(self._tab_position)
+        self._dock_overlay.show()
+        self._dock_overlay.raise_()
+
+    def _on_dock_drag_moved(self, global_pos):
+        local = self.mapFromGlobal(global_pos)
+        self._dock_overlay.setGeometry(self.rect())
+        self._dock_overlay.set_zone(_dock_zone_at(local, self.size()))
+        self._dock_overlay.raise_()
+
+    def _on_dock_drag_finished(self, global_pos):
+        zone = _dock_zone_at(self.mapFromGlobal(global_pos), self.size())
+        self._dock_overlay.hide()
+        self._dock_overlay.set_zone(None)
+        if zone:
+            self._set_tab_strip_position(zone)
+
+    def _toggle_maximized(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self._controls.set_maximized(self.isMaximized())
+        self._layout_edge_grips()
+
+    def _begin_window_move(self):
+        if self.isFullScreen():
+            return
+        handle = self.windowHandle()
+        if handle is None:
+            self._ensure_window_handle()
+            handle = self.windowHandle()
+        if self.isMaximized() and sys.platform != "win32":
+            # Restoring first lets X11/Xfce follow the cursor; Windows does this
+            # itself inside startSystemMove.
+            cursor = QCursor.pos()
+            geom = self.geometry()
+            width = max(geom.width(), 1)
+            ratio = (cursor.x() - geom.x()) / width
+            self.showNormal()
+            self._controls.set_maximized(False)
+            restored = self.geometry()
+            self.move(cursor.x() - int(restored.width() * ratio), cursor.y() - 12)
+        if handle is not None and handle.startSystemMove():
+            return
+        origin = QCursor.pos()
+        self._move_origin = origin
+        self._move_offset = origin - self.frameGeometry().topLeft()
+        self._manual_interacting = True
+        self.grabMouse()
+
+    def _begin_edge_resize(self, edges, global_pos):
+        if self.isMaximized() or self.isFullScreen() or not edges:
+            return
+        handle = self.windowHandle()
+        if handle is None:
+            self._ensure_window_handle()
+            handle = self.windowHandle()
+        if handle is not None and handle.startSystemResize(edges):
+            return
+        self._resize_edges = edges
+        self._resize_origin = QPoint(global_pos)
+        self._resize_geom = QRect(self.geometry())
+        self._manual_interacting = True
+        self.grabMouse()
+
+    def _ensure_window_handle(self):
+        if self.windowHandle() is None:
+            self.winId()
+
+    def _update_manual_move(self, global_pos):
+        if self._move_offset is None:
+            return
+        self.move(global_pos - self._move_offset)
+
+    def _update_manual_resize(self, global_pos):
+        if not self._resize_edges or self._resize_geom is None:
+            return
+        delta = global_pos - self._resize_origin
+        geom = QRect(self._resize_geom)
+        min_w = self.minimumWidth()
+        min_h = self.minimumHeight()
+        if self._resize_edges & Qt.Edge.LeftEdge:
+            geom.setLeft(min(geom.right() - min_w + 1, geom.left() + delta.x()))
+        if self._resize_edges & Qt.Edge.RightEdge:
+            geom.setRight(max(geom.left() + min_w - 1, geom.right() + delta.x()))
+        if self._resize_edges & Qt.Edge.TopEdge:
+            geom.setTop(min(geom.bottom() - min_h + 1, geom.top() + delta.y()))
+        if self._resize_edges & Qt.Edge.BottomEdge:
+            geom.setBottom(max(geom.top() + min_h - 1, geom.bottom() + delta.y()))
+        self.setGeometry(geom)
+
+    def _end_manual_interaction(self):
+        if not self._manual_interacting:
+            return
+        self._manual_interacting = False
+        self._move_origin = None
+        self._move_offset = None
+        self._resize_edges = Qt.Edge(0)
+        self._resize_origin = None
+        self._resize_geom = None
+        if QWidget.mouseGrabber() is self:
+            self.releaseMouse()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._controls.set_maximized(self.isMaximized())
+            self._layout_edge_grips()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_edge_grips()
+        if self._dock_overlay.isVisible():
+            self._dock_overlay.setGeometry(self.rect())
+            self._dock_overlay.raise_()
+
+    def mouseMoveEvent(self, event):
+        if self._manual_interacting:
+            pos = event.globalPosition().toPoint()
+            if self._move_offset is not None:
+                self._update_manual_move(pos)
+            elif self._resize_edges:
+                self._update_manual_resize(pos)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._manual_interacting:
+            self._end_manual_interaction()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._ensure_window_handle()
+        self._layout_edge_grips()
+        self._controls.set_maximized(self.isMaximized())
 
     # ----------------------------------------------------------------- tabs
     def add_tab(self, url: QUrl):
@@ -2209,6 +3241,18 @@ class BrowserWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         et = event.type()
+        if self._manual_interacting:
+            if et == QEvent.Type.MouseMove:
+                pos = event.globalPosition().toPoint()
+                if self._move_offset is not None:
+                    self._update_manual_move(pos)
+                elif self._resize_edges:
+                    self._update_manual_resize(pos)
+                return True
+            if et in (QEvent.Type.MouseButtonRelease, QEvent.Type.Leave):
+                if et == QEvent.Type.MouseButtonRelease:
+                    self._end_manual_interaction()
+                    return True
         # ShortcutOverride reaches the app-level filter even while QtWebEngine
         # holds native keyboard focus, so we act on it as well as KeyPress.
         if et in (
@@ -2453,6 +3497,9 @@ class BrowserWindow(QMainWindow):
         self.settings.setdefault("models", {})
         self.settings.setdefault("auto_organize_tabs", True)
         self.settings.setdefault("search_engine", "google")
+        self.settings.setdefault(
+            "tab_strip_position", _load_tab_strip_position(self.settings)
+        )
         # Migrate the old single-provider schema (api_key/model -> OpenAI).
         if "api_key" in self.settings:
             self.settings["keys"].setdefault("openai", self.settings.pop("api_key"))
@@ -2508,18 +3555,40 @@ class BrowserWindow(QMainWindow):
 
     def _tab_bar_menu(self, pos):
         index = self.tabs.tabBar().tabAt(pos)
-        if index < 0:
-            return
-        self.tabs.setCurrentIndex(index)
         menu = QMenu(self)
-        assign = menu.addMenu("Assign to group")
-        for cat in TAB_CATEGORY_ORDER:
-            action = assign.addAction(category_label(cat))
-            action.triggered.connect(
-                lambda _checked=False, c=cat: self._assign_tab_group(c)
+        if index >= 0:
+            self.tabs.setCurrentIndex(index)
+            assign = menu.addMenu("Assign to group")
+            for cat in TAB_CATEGORY_ORDER:
+                action = assign.addAction(category_label(cat))
+                action.triggered.connect(
+                    lambda _checked=False, c=cat: self._assign_tab_group(c)
+                )
+            menu.addAction("Clear manual group").triggered.connect(
+                self._clear_manual_group
             )
-        menu.addAction("Clear manual group").triggered.connect(self._clear_manual_group)
+            menu.addSeparator()
+        dock = menu.addMenu("Dock tab bar")
+        for key in TAB_STRIP_POSITIONS:
+            action = dock.addAction(TAB_STRIP_LABELS[key])
+            action.setCheckable(True)
+            action.setChecked(key == self._tab_position)
+            action.triggered.connect(
+                lambda _checked=False, p=key: self._set_tab_strip_position(p)
+            )
         menu.exec(self.tabs.tabBar().mapToGlobal(pos))
+
+    def _dock_handle_menu(self, pos):
+        menu = QMenu(self)
+        dock = menu.addMenu("Dock tab bar")
+        for key in TAB_STRIP_POSITIONS:
+            action = dock.addAction(TAB_STRIP_LABELS[key])
+            action.setCheckable(True)
+            action.setChecked(key == self._tab_position)
+            action.triggered.connect(
+                lambda _checked=False, p=key: self._set_tab_strip_position(p)
+            )
+        menu.exec(self._dock_handle.mapToGlobal(pos))
 
     def _rebuild_apps_menu(self):
         self.apps_menu.clear()
@@ -2756,6 +3825,8 @@ class BrowserWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setOrganizationName(APP_ORG_NAME)
+    app.setApplicationName(APP_NAME)
     window = BrowserWindow()
     window.show()
     sys.exit(app.exec())
