@@ -1342,17 +1342,22 @@ class TabDockHandle(QWidget):
         self.setObjectName("TabDockHandle")
         self.setToolTip("Drag to dock the tab bar at the top, side, or bottom")
         self.setCursor(Qt.CursorShape.OpenHandCursor)
-        self.setFixedSize(18, 28)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "#TabDockHandle { background: #d0d5dd; border-radius: 4px; }"
+            "#TabDockHandle:hover { background: #b8c0cc; }"
+        )
+        self.setFixedSize(22, 32)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self._press_global = None
         self._dragging = False
 
     def set_vertical(self, vertical):
         if vertical:
-            self.setFixedSize(28, 18)
+            self.setFixedSize(32, 22)
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         else:
-            self.setFixedSize(18, 28)
+            self.setFixedSize(22, 32)
             self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.update()
 
@@ -1361,7 +1366,7 @@ class TabDockHandle(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#98a2b3"))
+        painter.setBrush(QColor("#344054"))
         vertical = self.width() > self.height()
         if vertical:
             y = self.height() // 2
@@ -1411,13 +1416,24 @@ class TabDockHandle(QWidget):
 
 
 class DockDropOverlay(QWidget):
-    """Translucent edge highlights shown while dragging the tab strip."""
+    """Edge highlights shown while dragging the tab strip.
+
+    Implemented as a tool window so QMainWindow's layout cannot bury it.
+    """
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        super().__init__(parent, Qt.WindowType.Tool)
         self._zone = None
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setWindowOpacity(0.88)
         self.hide()
 
     def set_zone(self, zone):
@@ -1510,7 +1526,6 @@ class ChromeTabBar(GroupedTabBar):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMovable(True)
         self.setTabsClosable(True)
         self.setExpanding(False)
         self.setDocumentMode(True)
@@ -1518,14 +1533,24 @@ class ChromeTabBar(GroupedTabBar):
         self.setElideMode(Qt.TextElideMode.ElideRight)
         self.setUsesScrollButtons(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        # Built-in QTabBar moving is unreliable once ::tab stylesheets are set,
+        # so ChromeTabBar performs moveTab() itself after the drag threshold.
+        self.setMovable(False)
         self._window_drag = False
+        self._drag_index = -1
+        self._press_pos = None
 
     def mousePressEvent(self, event):
         self._window_drag = False
+        self._drag_index = -1
+        self._press_pos = event.position()
         if event.button() == Qt.MouseButton.LeftButton:
             pos = event.position().toPoint()
-            if self.tabAt(pos) < 0:
+            index = self.tabAt(pos)
+            if index < 0:
                 self._window_drag = True
+            else:
+                self._drag_index = index
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -1535,10 +1560,26 @@ class ChromeTabBar(GroupedTabBar):
                 self.empty_space_move_requested.emit()
             event.accept()
             return
+        if self._drag_index >= 0 and event.buttons() & Qt.MouseButton.LeftButton:
+            if (
+                self._press_pos is not None
+                and (event.position() - self._press_pos).manhattanLength()
+                >= QApplication.startDragDistance()
+            ):
+                over = self.tabAt(event.position().toPoint())
+                if over >= 0 and over != self._drag_index:
+                    self.moveTab(self._drag_index, over)
+                    self.setCurrentIndex(over)
+                    self._drag_index = over
+                    self._press_pos = event.position()
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         self._window_drag = False
+        self._drag_index = -1
+        self._press_pos = None
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
@@ -2220,13 +2261,12 @@ class BrowserWindow(QMainWindow):
         self.setWindowTitle("PyQt6 Browser" + (" - Insecret" if insecret else ""))
         self.setMinimumSize(640, 400)
         self.resize(1280, 820)
+        # Only Frameless + Customize: extra min/max/system-menu hints make many
+        # X11 WMs (and GNOME CSD) draw a native title bar on top of our chrome.
         self.setWindowFlags(
             Qt.WindowType.Window
             | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowSystemMenuHint
-            | Qt.WindowType.WindowMinimizeButtonHint
-            | Qt.WindowType.WindowMaximizeButtonHint
-            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.CustomizeWindowHint
         )
         self.setMouseTracking(True)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
@@ -2730,8 +2770,10 @@ class BrowserWindow(QMainWindow):
         self._dock_handle.set_vertical(vertical)
 
         self._clear_layout(self._title_row_layout)
+        # Strip internals are vertical on the sides; the window's central
+        # layout is the opposite so a side strip sits beside the page.
         self._strip_layout = self._replace_box_layout(self._strip_host, vertical)
-        self._central_layout = self._replace_box_layout(self._central, vertical)
+        self._central_layout = self._replace_box_layout(self._central, not vertical)
         self._configure_strip_metrics(vertical)
 
         self._strip_layout.addWidget(self._dock_handle)
@@ -2809,15 +2851,18 @@ class BrowserWindow(QMainWindow):
         for key, action in actions.items():
             action.setChecked(key == self._tab_position)
 
+    def _overlay_screen_rect(self):
+        return QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
+
     def _on_dock_drag_started(self):
-        self._dock_overlay.setGeometry(self.rect())
+        self._dock_overlay.setGeometry(self._overlay_screen_rect())
         self._dock_overlay.set_zone(self._tab_position)
         self._dock_overlay.show()
         self._dock_overlay.raise_()
 
     def _on_dock_drag_moved(self, global_pos):
         local = self.mapFromGlobal(global_pos)
-        self._dock_overlay.setGeometry(self.rect())
+        self._dock_overlay.setGeometry(self._overlay_screen_rect())
         self._dock_overlay.set_zone(_dock_zone_at(local, self.size()))
         self._dock_overlay.raise_()
 
@@ -3827,6 +3872,9 @@ def main():
     app = QApplication(sys.argv)
     app.setOrganizationName(APP_ORG_NAME)
     app.setApplicationName(APP_NAME)
+    # Fusion avoids GTK client-side decorations fighting a frameless window.
+    if sys.platform.startswith("linux"):
+        app.setStyle("Fusion")
     window = BrowserWindow()
     window.show()
     sys.exit(app.exec())
