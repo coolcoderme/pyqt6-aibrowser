@@ -1385,6 +1385,8 @@ class TabDockHandle(QWidget):
             self._dragging = False
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self.grabMouse()
+            self.dock_drag_started.emit()
+            self.dock_drag_moved.emit(event.globalPosition().toPoint())
             event.accept()
             return
         super().mousePressEvent(event)
@@ -1396,10 +1398,8 @@ class TabDockHandle(QWidget):
         current = event.globalPosition()
         if not self._dragging:
             distance = (current - self._press_global).manhattanLength()
-            if distance < QApplication.startDragDistance():
-                return
-            self._dragging = True
-            self.dock_drag_started.emit()
+            if distance >= QApplication.startDragDistance():
+                self._dragging = True
         self.dock_drag_moved.emit(current.toPoint())
         event.accept()
 
@@ -1407,10 +1407,12 @@ class TabDockHandle(QWidget):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         if QWidget.mouseGrabber() is self:
             self.releaseMouse()
-        if event.button() == Qt.MouseButton.LeftButton and self._dragging:
-            self.dock_drag_finished.emit(event.globalPosition().toPoint())
-            event.accept()
-        elif event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._dragging:
+                self.dock_drag_finished.emit(event.globalPosition().toPoint())
+            else:
+                # Click without a drag: dismiss the overlay, keep the current edge.
+                self.dock_drag_finished.emit(QPoint(-10000, -10000))
             event.accept()
         else:
             super().mouseReleaseEvent(event)
