@@ -3,8 +3,8 @@
 ## Cursor Cloud specific instructions
 
 `browserdemo.py` is a **PyQt6 desktop browser** whose pages are rendered by a
-local **Blink (Chromium)** process in [`blinkengine/`](blinkengine/). There is
-no HTTP server, database, or build step.
+local **Blink (Chromium)** process via the [`pyblink`](https://github.com/coolcoderme/pyblink)
+package. There is no HTTP server, database, or build step.
 
 ### Running the app
 
@@ -40,8 +40,8 @@ no HTTP server, database, or build step.
 
 ### Lint
 
-- `python3 -m flake8 browserdemo.py blinkengine` (config: `.flake8`)
-- `python3 -m pylint browserdemo.py blinkengine` (config: `.pylintrc`)
+- `python3 -m flake8 browserdemo.py` (config: `.flake8`)
+- `python3 -m pylint browserdemo.py` (config: `.pylintrc`)
 - Baseline: flake8 `E501` on the offline-page HTML; pylint ~9.9/10 and
   may exit non-zero on convention messages.
 

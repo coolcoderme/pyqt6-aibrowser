@@ -1,6 +1,12 @@
 # Runtime dependencies for browserdemo.py (PyQt6 chrome + Blink/Chromium engine)
 PyQt6
 
+# Blink engine lives in coolcoderme/pyblink (extracted from the former in-tree
+# blinkengine/ package). Pin the extract-PR branch until pyblink#1 merges, then
+# switch this to main or a release tag.
+# https://github.com/coolcoderme/pyblink/pull/1
+pyblink @ git+https://github.com/coolcoderme/pyblink.git@cursor/extract-pyblink-package-a58b
+
 # Google Chrome or Chromium is required on the system PATH (or set CHROME_PATH).
 # The Python UI talks to it over the Chrome DevTools Protocol.
 
