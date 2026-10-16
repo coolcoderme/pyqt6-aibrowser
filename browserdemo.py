@@ -897,6 +897,11 @@ def _chrome_stylesheet(colors):
         "#TitleRow { border-bottom: 1px solid %(border)s; }",
         "#TabDockHandle { background: %(tab_inactive)s; border-radius: 4px; }",
         "#TabDockHandle:hover { background: %(button_hover)s; }",
+        "#NewTabButton { background: transparent; border: none; border-radius: 8px;",
+        "  padding: 0; min-width: 28px; min-height: 28px; }",
+        "#NewTabButton:hover { background: %(caption_hover)s; }",
+        "#NewTabButton:pressed { background: %(tab_inactive)s; }",
+        "#StripDragPad { background: transparent; }",
         "#WindowControlButtons { background: transparent; }",
         "QDialog { background: %(surface)s; color: %(text)s; }",
         "QMenuBar { background: %(window)s; color: %(chrome_text)s; }",
@@ -1739,6 +1744,95 @@ class TabDockHandle(QWidget):
         self._dragging = False
 
 
+class NewTabButton(QPushButton):
+    """Compact '+' that sits immediately after the last open tab."""
+
+    # pylint: disable=invalid-name
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("NewTabButton")
+        self.setFlat(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(28, 28)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        shortcut = QKeySequence("Ctrl+T").toString(
+            QKeySequence.SequenceFormat.NativeText
+        )
+        self.setToolTip(f"New tab ({shortcut})")
+        self._colors = appearance_colors({})
+        self.apply_appearance(self._colors)
+
+    def apply_appearance(self, colors):
+        self._colors = colors
+        hover = colors.get("caption_hover", "#d0d3d8")
+        pressed = colors.get("tab_inactive", "#c0c4c8")
+        self.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 8px;"
+            " padding: 0; min-width: 28px; min-height: 28px; }"
+            f"QPushButton:hover {{ background: {hover}; }}"
+            f"QPushButton:pressed {{ background: {pressed}; }}"
+        )
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self.underMouse():
+            glyph = QColor(self._colors.get("chrome_text", "#202124"))
+        else:
+            glyph = QColor(self._colors.get("chrome_muted", "#344054"))
+        painter.setPen(QPen(glyph, 1.6))
+        cx, cy = self.width() / 2, self.height() / 2
+        arm = 6
+        painter.drawLine(int(cx - arm), int(cy), int(cx + arm), int(cy))
+        painter.drawLine(int(cx), int(cy - arm), int(cx), int(cy + arm))
+
+
+class StripDragPad(QWidget):
+    """Leftover tab-strip space: drag to move, double-click to maximize."""
+
+    # pylint: disable=invalid-name
+
+    move_requested = pyqtSignal()
+    toggle_max_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("StripDragPad")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._pressing = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pressing = True
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pressing and event.buttons() & Qt.MouseButton.LeftButton:
+            self._pressing = False
+            self.move_requested.emit()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._pressing = False
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_max_requested.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 class DockDropOverlay(QWidget):
     """Edge highlights shown while dragging the tab strip.
 
@@ -1878,6 +1972,14 @@ class ChromeTabBar(GroupedTabBar):
         self._window_drag = False
         self._drag_index = -1
         self._press_pos = None
+
+    def tabInserted(self, index):
+        super().tabInserted(index)
+        self.updateGeometry()
+
+    def tabRemoved(self, index):
+        super().tabRemoved(index)
+        self.updateGeometry()
 
     def mousePressEvent(self, event):
         self._window_drag = False
@@ -2786,6 +2888,14 @@ class BrowserWindow(QMainWindow):
         self._dock_handle.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._dock_handle.customContextMenuRequested.connect(self._dock_handle_menu)
 
+        self._new_tab_btn = NewTabButton()
+        self._new_tab_btn.clicked.connect(
+            lambda: self.add_tab(QUrl(self.home_url()))
+        )
+        self._strip_fill = StripDragPad()
+        self._strip_fill.move_requested.connect(self._begin_window_move)
+        self._strip_fill.toggle_max_requested.connect(self._toggle_maximized)
+
         self._controls = WindowControlButtons()
         self._controls.minimize_requested.connect(self.showMinimized)
         self._controls.maximize_requested.connect(self._toggle_maximized)
@@ -2912,11 +3022,6 @@ class BrowserWindow(QMainWindow):
         star.setShortcut(QKeySequence("Ctrl+D"))
         star.triggered.connect(lambda: self.add_webbox(WEBBOX_FAVORITE))
         nav.addAction(star)
-
-        new_tab = QAction("New Tab", self)
-        new_tab.setShortcut(QKeySequence("Ctrl+T"))
-        new_tab.triggered.connect(lambda: self.add_tab(QUrl(self.home_url())))
-        nav.addAction(new_tab)
 
         inspect = QAction("Inspect", self)
         inspect.setShortcut(QKeySequence("F12"))
@@ -3236,11 +3341,20 @@ class BrowserWindow(QMainWindow):
         # Strip internals are vertical on the sides; the window's central
         # layout is the opposite so a side strip sits beside the page.
         self._strip_layout = self._replace_box_layout(self._strip_host, vertical)
+        self._strip_layout.setSpacing(2)
         self._central_layout = self._replace_box_layout(self._central, not vertical)
         self._configure_strip_metrics(vertical)
 
+        if position == "top":
+            btn_align = Qt.AlignmentFlag.AlignBottom
+        elif position == "bottom":
+            btn_align = Qt.AlignmentFlag.AlignTop
+        else:
+            btn_align = Qt.AlignmentFlag.AlignHCenter
         self._strip_layout.addWidget(self._dock_handle)
-        self._strip_layout.addWidget(tab_bar, 1)
+        self._strip_layout.addWidget(tab_bar, 0)
+        self._strip_layout.addWidget(self._new_tab_btn, 0, btn_align)
+        self._strip_layout.addWidget(self._strip_fill, 1)
 
         if _controls_on_left():
             self._title_row_layout.addWidget(self._controls)
@@ -3280,6 +3394,12 @@ class BrowserWindow(QMainWindow):
             tab_bar.setMaximumWidth(220)
             tab_bar.setMinimumHeight(0)
             tab_bar.setMaximumHeight(16777215)
+            tab_bar.setSizePolicy(
+                QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+            )
+            self._strip_fill.setSizePolicy(
+                QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
+            )
             self._strip_host.setMinimumWidth(150)
             self._strip_host.setMaximumWidth(228)
             self._strip_host.setMinimumHeight(0)
@@ -3293,6 +3413,12 @@ class BrowserWindow(QMainWindow):
         tab_bar.setMaximumWidth(16777215)
         tab_bar.setMinimumHeight(0)
         tab_bar.setMaximumHeight(16777215)
+        tab_bar.setSizePolicy(
+            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred
+        )
+        self._strip_fill.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
         self._strip_host.setMinimumWidth(0)
         self._strip_host.setMaximumWidth(16777215)
         self._strip_host.setMinimumHeight(0)
@@ -4073,6 +4199,8 @@ class BrowserWindow(QMainWindow):
             self._controls.apply_appearance(colors)
         if hasattr(self, "_dock_handle"):
             self._dock_handle.apply_appearance(colors)
+        if hasattr(self, "_new_tab_btn"):
+            self._new_tab_btn.apply_appearance(colors)
         if hasattr(self, "_caption"):
             self._caption.apply_appearance(colors)
         if hasattr(self, "_dock_overlay"):
@@ -4081,6 +4209,7 @@ class BrowserWindow(QMainWindow):
             "#WindowChrome, #TitleRow, #TabStripHost, #CaptionDragArea {"
             " background: %(window)s; }"
             "#TitleRow { border-bottom: 1px solid %(border)s; }"
+            "#StripDragPad { background: transparent; }"
         ) % colors
         if hasattr(self, "_chrome"):
             self._chrome.setStyleSheet(chrome_fill)
